@@ -1,0 +1,796 @@
+"""
+Parametric Clapboard Siding Generator for FreeCAD v4.2.0
+Generates realistic clapboard siding from a sketch defining wall outline and openings
+
+Author: Generated for model railroading (HO/O/N scale)
+Usage: Select one or more sketches, run as macro in FreeCAD
+
+Version History:
+- 4.2.0: ADD: Closed wire validation to catch sketch errors early
+         FIX: Replace thin carrier with proper structural wall using wallThickness parameter
+         Structural wall extrudes inward, clapboards extrude outward
+- 4.1.0: FIX: Proper extrusion direction using face normals for each face
+         FIX: Implement gable cutting by detecting non-vertical edges
+         FIX: Improved hole cutting that works on all wall orientations
+- 4.0.1: FIX: Use face normals to determine extrusion direction (inward for walls, outward for holes)
+- 4.0.0: REWRITE - Match proven manual workflow
+- 3.5.6: Use array+fuse approach, then cut holes once
+- 3.5.0: Fix taper orientation - thick on outside, thin on inside
+- 3.4.9: Use triangular/tapered clapboard profile (thick at bottom, thin at top)
+- 3.4.8: Create L-shaped corner trim that wraps both adjacent walls
+- 3.4.7: Replace complex concave detection with simpler extreme-position check
+- 3.4.0: Support for vertical sketches (XZ/YZ planes) - auto-detect sketch orientation
+- 3.3.0: Simplified - clapboards always horizontal
+- 3.2.0: Added batch mode
+- 3.0.0: Added concave corner detection
+- 2.0.0: Fixed orientation detection
+- 1.0.0: Initial release
+"""
+
+import FreeCAD as App
+import Part
+from FreeCAD import Vector
+import math
+
+VERSION = "4.2.0"
+GENERATOR_NAME = "clapboard_generator"
+
+
+def find_spreadsheet(doc, preferred_names):
+    """
+    Find spreadsheet by checking both object name and label.
+    """
+    for ss_name in preferred_names:
+        # Try by object name first
+        obj = doc.getObject(ss_name)
+        if obj and obj.TypeId == 'Spreadsheet::Sheet':
+            print(f"Found spreadsheet by name: '{ss_name}'")
+            return obj
+        
+        # Try by label
+        for obj in doc.Objects:
+            if obj.TypeId == 'Spreadsheet::Sheet' and obj.Label == ss_name:
+                print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
+                return obj
+    
+    return None
+
+
+def get_params_from_spreadsheet(doc):
+    """
+    Try to read clapboard parameters from spreadsheet.
+    """
+    preferred_names = ["params", "ClapboardParameters", "BuildingParameters", "Spreadsheet"]
+    
+    ss = find_spreadsheet(doc, preferred_names)
+    if ss is None:
+        return None
+    
+    params = {}
+    param_map = {
+        'clapboard_height': ['clapboard_height', 'ClapboardHeight', 'clapboardHeight', 'reveal'],
+        'clapboard_thickness': ['clapboard_thickness', 'ClapboardThickness', 'thickness', 'materialThickness'],
+        'trim_width': ['trim_width', 'TrimWidth'],
+        'trim_thickness': ['trim_thickness', 'TrimThickness', 'materialThickness'],
+        'wall_thickness': ['wall_thickness', 'wallThickness', 'WallThickness'],
+    }
+    
+    for param_key, possible_names in param_map.items():
+        for name in possible_names:
+            try:
+                val = ss.get(name)
+                if val is not None:
+                    params[param_key] = float(val)
+                    break
+            except:
+                continue
+    
+    return params if params else None
+
+
+def get_sketch_wires(sketch):
+    """
+    Get sketch wires in LOCAL coordinates (not transformed).
+    Returns (outer_wire, hole_wires) in sketch's coordinate system.
+    Validates that wires are closed.
+    """
+    if not hasattr(sketch, 'Shape'):
+        raise ValueError("Selected object is not a sketch")
+    
+    wires = sketch.Shape.Wires
+    if len(wires) == 0:
+        raise ValueError("Sketch has no wires")
+    
+    # Find outer wire (largest area)
+    outer_wire = max(wires, key=lambda w: abs(Part.Face(w).Area))
+    hole_wires = [w for w in wires if w != outer_wire]
+    
+    # Validate that outer wire is closed
+    if not outer_wire.isClosed():
+        raise ValueError(f"Outer wire in sketch '{sketch.Label}' is not closed! Cannot generate clapboards from open wire.")
+    
+    # Validate hole wires are closed
+    for i, hw in enumerate(hole_wires):
+        if not hw.isClosed():
+            raise ValueError(f"Hole wire {i} in sketch '{sketch.Label}' is not closed!")
+    
+    return outer_wire, hole_wires
+
+
+def is_building_corner(edge, bbox, vertical_axis='y', horizontal_axis='x', tolerance=1.0):
+    """
+    Check if a vertical edge is at a building corner (extreme position).
+    Interior edges (doors/windows) will NOT be at the extreme positions.
+    
+    Args:
+        edge: Edge to check
+        bbox: Bounding box of the wall
+        vertical_axis: 'y' for XY plane, 'z' for XZ/YZ plane
+        horizontal_axis: 'x' or 'y'
+        tolerance: Distance tolerance (1mm by default)
+    
+    Returns:
+        True if edge is at an extreme position (building corner)
+        False if edge is interior (door/window jamb)
+    """
+    try:
+        edge_start = edge.valueAt(edge.FirstParameter)
+        edge_end = edge.valueAt(edge.LastParameter)
+        
+        # Get the horizontal coordinate of this edge
+        if horizontal_axis == 'x':
+            h_pos = edge_start.x
+            h_min = bbox.XMin
+            h_max = bbox.XMax
+        else:
+            h_pos = edge_start.y
+            h_min = bbox.YMin
+            h_max = bbox.YMax
+        
+        # Check if edge is at either extreme (building corner)
+        at_min = abs(h_pos - h_min) < tolerance
+        at_max = abs(h_pos - h_max) < tolerance
+        
+        is_corner = at_min or at_max
+        
+        print(f"    DEBUG: Edge at h_pos={h_pos:.2f}, h_min={h_min:.2f}, h_max={h_max:.2f}")
+        print(f"    DEBUG: at_min={at_min}, at_max={at_max}, is_corner={is_corner}")
+        
+        return is_corner
+        
+    except Exception as e:
+        print(f"Warning: Could not check if edge is at corner: {e}")
+        return False
+
+
+def get_face_normal(face):
+    """
+    Get the normal vector of a face at its center.
+    
+    Args:
+        face: Part.Face object
+    
+    Returns:
+        Vector: Normal vector (unit length)
+    """
+    # Sample at the center of the face's parameter space
+    u_range = face.ParameterRange[:2]
+    v_range = face.ParameterRange[2:]
+    u_mid = (u_range[0] + u_range[1]) / 2
+    v_mid = (v_range[0] + v_range[1]) / 2
+    normal = face.normalAt(u_mid, v_mid)
+    
+    return normal
+
+
+def find_gable_edges(wire, vertical_axis='y', angle_tolerance=5.0):
+    """
+    Find non-vertical edges in the wire that define gable profiles.
+    These are edges that are not parallel to the vertical axis.
+    
+    Args:
+        wire: Wire to search
+        vertical_axis: 'y' for XY plane, 'z' for XZ/YZ plane
+        angle_tolerance: Tolerance in degrees for considering an edge non-vertical
+    
+    Returns:
+        List of non-vertical edges (gable edges)
+    """
+    gable_edges = []
+    
+    # Define the vertical direction vector
+    if vertical_axis == 'z':
+        vert_dir = Vector(0, 0, 1)
+    else:
+        vert_dir = Vector(0, 1, 0)
+    
+    for edge in wire.Edges:
+        if edge.Length < 0.01:
+            continue
+        
+        try:
+            # Get edge direction
+            direction = edge.tangentAt(edge.FirstParameter)
+            direction.normalize()
+            
+            # Calculate angle with vertical
+            dot_product = abs(direction.dot(vert_dir))
+            angle = math.degrees(math.acos(min(1.0, dot_product)))
+            
+            # If angle is more than tolerance from 0° (vertical), it's a gable edge
+            if angle > angle_tolerance:
+                gable_edges.append(edge)
+                print(f"  Found gable edge: angle={angle:.1f}° from vertical")
+        
+        except Exception as e:
+            print(f"Warning: Could not analyze edge: {e}")
+    
+    return gable_edges
+
+
+def create_clapboard_wall(sketch, clapboard_height=0.8, clapboard_thickness=0.2,
+                         trim_width=1.5, trim_thickness=0.2, wall_thickness=2.0):
+    """
+    Generate clapboard siding from a sketch.
+    Works in sketch's local coordinate system, transforms at end.
+    
+    Args:
+        sketch: FreeCAD sketch object
+        clapboard_height: Reveal height (mm)
+        clapboard_thickness: Thickness at bottom edge (mm)
+        trim_width: Width of corner trim (mm)
+        trim_thickness: Trim projection (mm)
+        wall_thickness: Thickness of structural interior wall (mm)
+    
+    Returns:
+        Part.Compound of structural wall, trim, and clapboards (transformed to global coordinates)
+    """
+    print(f"\nGenerating clapboards for '{sketch.Label}' (generator v{VERSION})...")
+    
+    # Get wires in LOCAL sketch coordinates - validates that wires are closed
+    outer_wire, hole_wires = get_sketch_wires(sketch)
+    
+    # Get bounding box in local coordinates
+    bbox = outer_wire.BoundBox
+    print(f"Sketch local bounds: X=[{bbox.XMin:.1f}, {bbox.XMax:.1f}], "
+          f"Y=[{bbox.YMin:.1f}, {bbox.YMax:.1f}], Z=[{bbox.ZMin:.1f}, {bbox.ZMax:.1f}]")
+    
+    # Determine sketch orientation (which axes have extent)
+    x_extent = bbox.XMax - bbox.XMin
+    y_extent = bbox.YMax - bbox.YMin
+    z_extent = bbox.ZMax - bbox.ZMin
+    
+    # Determine which plane the sketch is in by finding which axis has near-zero extent
+    # For vertical walls (XZ or YZ plane), one axis will be essentially flat
+    if x_extent < 0.1:
+        # YZ plane sketch (wall at constant X)
+        wall_width = y_extent
+        wall_height = z_extent
+        vertical_axis = 'z'
+        horizontal_axis = 'y'
+    elif y_extent < 0.1:
+        # XZ plane sketch (wall at constant Y)
+        wall_width = x_extent
+        wall_height = z_extent
+        vertical_axis = 'z'
+        horizontal_axis = 'x'
+    elif z_extent < 0.1:
+        # XY plane sketch (horizontal wall/floor at constant Z)
+        wall_width = x_extent
+        wall_height = y_extent
+        vertical_axis = 'y'
+        horizontal_axis = 'x'
+    else:
+        # All three axes have extent - use largest as vertical for walls
+        if z_extent >= y_extent and z_extent >= x_extent:
+            # Z is tallest - probably XZ or YZ plane
+            if x_extent > y_extent:
+                wall_width = x_extent
+                wall_height = z_extent
+                vertical_axis = 'z'
+                horizontal_axis = 'x'
+            else:
+                wall_width = y_extent
+                wall_height = z_extent
+                vertical_axis = 'z'
+                horizontal_axis = 'y'
+        else:
+            # XY plane
+            wall_width = x_extent
+            wall_height = y_extent
+            vertical_axis = 'y'
+            horizontal_axis = 'x'
+    
+    print(f"Wall dimensions: {wall_width:.2f}mm wide x {wall_height:.2f}mm tall")
+    print(f"Sketch orientation: vertical_axis={vertical_axis}, horizontal_axis={horizontal_axis}")
+    
+    # Create faces for boolean operations (in local coords)
+    wall_face = Part.Face(outer_wire)
+    holes_faces = [Part.Face(hw) for hw in hole_wires]
+    
+    # Get face normal - this determines extrusion direction
+    normal = get_face_normal(wall_face)
+    print(f"Wall face normal: ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
+    
+    parts = []
+    
+    # 1. Create trim boards on vertical edges
+    print("\nCreating trim boards...")
+    vertical_edges = find_vertical_edges(outer_wire, vertical_axis)
+    trim_count = 0
+    
+    for edge in vertical_edges:
+        if is_building_corner(edge, bbox, vertical_axis, horizontal_axis):
+            try:
+                trim = create_trim_board_local(edge, trim_thickness, trim_width, 
+                                              vertical_axis, horizontal_axis, bbox, normal)
+                parts.append(trim)
+                trim_count += 1
+            except Exception as e:
+                print(f"Warning: Failed to create trim: {e}")
+        else:
+            print(f"  Skipping interior edge (door/window)")
+    
+    print(f"Created {trim_count} trim boards")
+    
+    # 2. Create horizontal clapboard courses
+    print("\nCreating clapboard courses...")
+    num_courses = int(math.ceil(wall_height / clapboard_height))
+    print(f"Generating {num_courses} courses")
+    
+    successful = 0
+    for i in range(num_courses):
+        # Position along vertical axis
+        # Add small overlap (0.01mm) to avoid coplanar face rendering issues
+        overlap = 0.01 if i > 0 else 0
+        
+        if vertical_axis == 'z':
+            vert_pos = bbox.ZMin + i * clapboard_height - overlap
+        else:
+            vert_pos = bbox.YMin + i * clapboard_height - overlap
+        
+        try:
+            clapboard = create_clapboard_course_local(
+                vert_pos, bbox, clapboard_height, clapboard_thickness,
+                vertical_axis, horizontal_axis, normal
+            )
+            if clapboard:
+                parts.append(clapboard)
+                successful += 1
+        except Exception as e:
+            print(f"Warning: Course {i} failed: {e}")
+    
+    print(f"Successfully created {successful}/{num_courses} courses")
+    print(f"Total parts (trim + clapboards): {len(parts)}")
+    
+    if len(parts) == 0:
+        raise RuntimeError("No parts were created!")
+    
+    # STEP 1: Create structural wall by extruding wall face INWARD (opposite to normal)
+    print(f"\nCreating structural wall (thickness={wall_thickness:.2f}mm)...")
+    
+    # Extrude INWARD (opposite to outward-facing normal) for structural strength
+    structural_wall_vec = normal * -wall_thickness
+    structural_wall = wall_face.extrude(structural_wall_vec)
+    print(f"Structural wall created: volume={structural_wall.Volume:.2f} mm³")
+    
+    # STEP 2: Fuse all clapboard courses and trim together
+    print("\nFusing trim and clapboard courses...")
+    if len(parts) == 1:
+        fused_exterior = parts[0]
+    else:
+        fused_exterior = parts[0].fuse(parts[1:])
+    print(f"Fused {len(parts)} exterior parts")
+    
+    # STEP 3: Fuse exterior (clapboards + trim) to structural wall
+    print("Fusing exterior to structural wall...")
+    combined = structural_wall.fuse(fused_exterior)
+    print(f"Combined volume: {combined.Volume:.2f} mm³")
+    
+    # STEP 4: Cut gable profile if present
+    print("\nChecking for gable edges...")
+    gable_edges = find_gable_edges(outer_wire, vertical_axis)
+    
+    if len(gable_edges) > 0:
+        print(f"Found {len(gable_edges)} gable edges - cutting gable profile...")
+        
+        # Create a cutting solid from the gable profile
+        # Extrude the wall face through both structural wall and clapboards
+        gable_cutter_distance = wall_thickness + clapboard_thickness * 3
+        
+        try:
+            # Extrude in both directions to create the gable envelope
+            gable_solid_out = wall_face.extrude(normal * clapboard_thickness * 3)
+            gable_solid_in = wall_face.extrude(normal * -wall_thickness)
+            gable_solid = gable_solid_out.fuse(gable_solid_in)
+            
+            # Keep only what's inside the gable profile
+            combined = combined.common(gable_solid)
+            print(f"Gable profile cut applied")
+            
+        except Exception as e:
+            print(f"Warning: Gable cutting failed: {e}")
+    else:
+        print("No gable edges found - rectangular wall")
+    
+    # STEP 5: Cut holes from combined solid
+    print(f"\nCutting {len(holes_faces)} holes...")
+    final_result = combined
+    
+    # Extrude holes through entire assembly (structural wall + clapboards)
+    hole_extrude_distance = wall_thickness + clapboard_thickness * 2
+    
+    holes_cut = 0
+    for i, hole_face in enumerate(holes_faces):
+        try:
+            # Extrude in both directions to ensure we cut through regardless of orientation
+            hole_volume_fwd = hole_face.extrude(normal * clapboard_thickness * 2)
+            hole_volume_back = hole_face.extrude(normal * -hole_extrude_distance)
+            
+            # Fuse both directions
+            hole_volume = hole_volume_fwd.fuse(hole_volume_back)
+            
+            volume_before = final_result.Volume
+            final_result = final_result.cut(hole_volume)
+            volume_after = final_result.Volume
+            volume_removed = volume_before - volume_after
+            
+            if volume_removed > 0.001:
+                holes_cut += 1
+                print(f"  Hole {i}: Removed {volume_removed:.2f} mm³")
+            else:
+                print(f"  WARNING: Hole {i} removed no volume!")
+        except Exception as e:
+            print(f"  Warning: Failed to cut hole {i}: {e}")
+    
+    print(f"Cut {holes_cut}/{len(holes_faces)} holes successfully")
+    
+    return final_result
+
+
+def find_vertical_edges(wire, vertical_axis='y'):
+    """
+    Find edges parallel to the vertical axis in sketch local coordinates.
+    
+    Args:
+        wire: Wire to search
+        vertical_axis: 'y' for XY plane sketches, 'z' for XZ plane sketches
+    
+    Returns list of vertical edges.
+    """
+    vertical_edges = []
+    
+    for edge in wire.Edges:
+        if edge.Length < 0.01:
+            continue
+        
+        try:
+            direction = edge.tangentAt(edge.FirstParameter)
+            direction.normalize()
+            
+            # Check if edge is parallel to vertical axis
+            if vertical_axis == 'z':
+                # For XZ or YZ plane, vertical means parallel to Z axis
+                is_vertical = abs(abs(direction.z) - 1.0) < 0.01
+            else:
+                # For XY plane, vertical means parallel to Y axis
+                is_vertical = abs(abs(direction.y) - 1.0) < 0.01
+            
+            if is_vertical:
+                vertical_edges.append(edge)
+        
+        except Exception as e:
+            print(f"Warning: Could not analyze edge: {e}")
+    
+    return vertical_edges
+
+
+def create_trim_board_local(edge, thickness, width, vertical_axis, horizontal_axis, bbox, normal):
+    """
+    Create a trim board along a vertical edge in local coordinates.
+    The trim extends outward from the wall surface.
+    
+    Args:
+        edge: Vertical edge to place trim on
+        thickness: How far trim projects from wall (mm)
+        width: Width of trim board (mm)
+        vertical_axis: 'y' or 'z'
+        horizontal_axis: 'x' or 'y'
+        bbox: Bounding box of the wall
+        normal: Face normal vector (determines extrusion direction)
+    
+    Returns:
+        Part shape for trim board
+    """
+    edge_start = edge.valueAt(edge.FirstParameter)
+    edge_end = edge.valueAt(edge.LastParameter)
+    
+    # Make sure start is at bottom
+    if vertical_axis == 'z':
+        if edge_end.z < edge_start.z:
+            edge_start, edge_end = edge_end, edge_start
+    else:
+        if edge_end.y < edge_start.y:
+            edge_start, edge_end = edge_end, edge_start
+    
+    # Create trim profile rectangle in the plane perpendicular to the edge
+    # The trim extends outward (along normal) and has width along horizontal axis
+    
+    if vertical_axis == 'z':
+        # XZ or YZ plane
+        if horizontal_axis == 'x':
+            # XZ plane
+            # Trim rectangle in YZ plane at edge position
+            x_pos = edge_start.x
+            
+            # Determine offset direction based on normal
+            # Normal points outward, trim should extend in that direction
+            y_offset = thickness if normal.y > 0 else -thickness
+            
+            profile = [
+                Vector(x_pos - width/2, bbox.YMin, edge_start.z),
+                Vector(x_pos + width/2, bbox.YMin, edge_start.z),
+                Vector(x_pos + width/2, bbox.YMin, edge_end.z),
+                Vector(x_pos - width/2, bbox.YMin, edge_end.z),
+                Vector(x_pos - width/2, bbox.YMin, edge_start.z)
+            ]
+            
+            # Extrude along Y axis (outward from wall)
+            profile_wire = Part.makePolygon(profile)
+            profile_face = Part.Face(profile_wire)
+            trim = profile_face.extrude(Vector(0, y_offset, 0))
+            
+        else:
+            # YZ plane
+            y_pos = edge_start.y
+            
+            x_offset = thickness if normal.x > 0 else -thickness
+            
+            profile = [
+                Vector(bbox.XMin, y_pos - width/2, edge_start.z),
+                Vector(bbox.XMin, y_pos + width/2, edge_start.z),
+                Vector(bbox.XMin, y_pos + width/2, edge_end.z),
+                Vector(bbox.XMin, y_pos - width/2, edge_end.z),
+                Vector(bbox.XMin, y_pos - width/2, edge_start.z)
+            ]
+            
+            profile_wire = Part.makePolygon(profile)
+            profile_face = Part.Face(profile_wire)
+            trim = profile_face.extrude(Vector(x_offset, 0, 0))
+    else:
+        # XY plane
+        x_pos = edge_start.x
+        
+        z_offset = thickness if normal.z > 0 else -thickness
+        
+        profile = [
+            Vector(x_pos - width/2, edge_start.y, 0),
+            Vector(x_pos + width/2, edge_start.y, 0),
+            Vector(x_pos + width/2, edge_end.y, 0),
+            Vector(x_pos - width/2, edge_end.y, 0),
+            Vector(x_pos - width/2, edge_start.y, 0)
+        ]
+        
+        profile_wire = Part.makePolygon(profile)
+        profile_face = Part.Face(profile_wire)
+        trim = profile_face.extrude(Vector(0, 0, z_offset))
+    
+    return trim
+
+
+def create_clapboard_course_local(vert_position, bbox, clapboard_height, clapboard_thickness,
+                                  vertical_axis, horizontal_axis, normal):
+    """
+    Create one horizontal clapboard course in local coordinates.
+    The clapboard extends outward from the wall surface (along normal direction).
+    
+    Args:
+        vert_position: Position along vertical axis (Y or Z)
+        bbox: Bounding box of wall sketch
+        clapboard_height: Height of clapboard reveal (mm)
+        clapboard_thickness: Thickness at bottom edge (mm)
+        vertical_axis: 'y' or 'z'
+        horizontal_axis: 'x' or 'y'
+        normal: Face normal vector (determines extrusion direction)
+    
+    Returns:
+        Part shape for clapboard course (or None if out of bounds)
+    """
+    # Get extents along horizontal and vertical axes
+    if vertical_axis == 'z':
+        # XZ or YZ plane sketch
+        if horizontal_axis == 'x':
+            # XZ plane
+            h_min, h_max = bbox.XMin - 0.1, bbox.XMax + 0.1
+            v_bottom, v_top = vert_position, vert_position + clapboard_height
+            v_max = bbox.ZMax + 0.1
+            
+            # Make sure we don't exceed wall bounds
+            if v_top > v_max:
+                v_top = v_max
+            if v_bottom >= bbox.ZMax:
+                return None
+            
+            # Create triangular profile for clapboard
+            # Bottom edge is thick on OUTSIDE (along normal), top edge is thin
+            thin_thickness = 0.01  # Very thin at top
+            
+            # Determine the base Y position and direction based on normal
+            base_y = bbox.YMin
+            thick_offset = clapboard_thickness if normal.y > 0 else -clapboard_thickness
+            thin_offset = thin_thickness if normal.y > 0 else -thin_thickness
+            
+            # Profile vertices (in XZ plane at Y position)
+            # Create outer surface (thick at bottom, thin at top) and inner surface (flat)
+            profile = [
+                Vector(h_min, base_y + thick_offset, v_bottom),  # Bottom left (outside, thick)
+                Vector(h_max, base_y + thick_offset, v_bottom),  # Bottom right (outside, thick)
+                Vector(h_max, base_y + thin_offset, v_top),      # Top right (outside, thin)
+                Vector(h_min, base_y + thin_offset, v_top),      # Top left (outside, thin)
+                Vector(h_min, base_y, v_top),                     # Top left (inside, thin)
+                Vector(h_max, base_y, v_top),                     # Top right (inside, thin)
+                Vector(h_max, base_y, v_bottom),                  # Bottom right (inside)
+                Vector(h_min, base_y, v_bottom)                   # Bottom left (inside)
+            ]
+            
+            # Create faces for the clapboard solid
+            # Outside face (thick at bottom, thin at top)
+            outside_wire = Part.makePolygon([profile[0], profile[1], profile[2], profile[3], profile[0]])
+            outside_face = Part.Face(outside_wire)
+            
+            # Inside face (flat, against wall)
+            inside_wire = Part.makePolygon([profile[7], profile[6], profile[5], profile[4], profile[7]])
+            inside_face = Part.Face(inside_wire)
+            
+            # Create loft between inside and outside
+            clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+            
+        else:
+            # YZ plane
+            h_min, h_max = bbox.YMin - 0.1, bbox.YMax + 0.1
+            v_bottom, v_top = vert_position, vert_position + clapboard_height
+            v_max = bbox.ZMax + 0.1
+            
+            if v_top > v_max:
+                v_top = v_max
+            if v_bottom >= bbox.ZMax:
+                return None
+            
+            thin_thickness = 0.01
+            
+            base_x = bbox.XMin
+            thick_offset = clapboard_thickness if normal.x > 0 else -clapboard_thickness
+            thin_offset = thin_thickness if normal.x > 0 else -thin_thickness
+            
+            # Outside (thick at bottom) to inside (flat against wall)
+            profile = [
+                Vector(base_x + thick_offset, h_min, v_bottom),  # Bottom (outside, thick)
+                Vector(base_x + thick_offset, h_max, v_bottom),
+                Vector(base_x + thin_offset, h_max, v_top),      # Top (outside, thin)
+                Vector(base_x + thin_offset, h_min, v_top),
+                Vector(base_x, h_min, v_top),                     # Top (inside)
+                Vector(base_x, h_max, v_top),
+                Vector(base_x, h_max, v_bottom),                  # Bottom (inside)
+                Vector(base_x, h_min, v_bottom)
+            ]
+            
+            outside_wire = Part.makePolygon([profile[0], profile[1], profile[2], profile[3], profile[0]])
+            inside_wire = Part.makePolygon([profile[7], profile[6], profile[5], profile[4], profile[7]])
+            clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+    else:
+        # XY plane sketch
+        h_min, h_max = bbox.XMin - 0.1, bbox.XMax + 0.1
+        v_bottom, v_top = vert_position, vert_position + clapboard_height
+        v_max = bbox.YMax + 0.1
+        
+        if v_top > v_max:
+            v_top = v_max
+        if v_bottom >= bbox.YMax:
+            return None
+        
+        thin_thickness = 0.01
+        
+        base_z = 0  # XY plane is at Z=0 in local coords
+        thick_offset = clapboard_thickness if normal.z > 0 else -clapboard_thickness
+        thin_offset = thin_thickness if normal.z > 0 else -thin_thickness
+        
+        # Outside (thick) to inside (flat)
+        profile = [
+            Vector(h_min, v_bottom, base_z + thick_offset),  # Bottom (outside, thick)
+            Vector(h_max, v_bottom, base_z + thick_offset),
+            Vector(h_max, v_top, base_z + thin_offset),      # Top (outside, thin)
+            Vector(h_min, v_top, base_z + thin_offset),
+            Vector(h_min, v_top, base_z),                     # Top (inside)
+            Vector(h_max, v_top, base_z),
+            Vector(h_max, v_bottom, base_z),                  # Bottom (inside)
+            Vector(h_min, v_bottom, base_z)
+        ]
+        
+        outside_wire = Part.makePolygon([profile[0], profile[1], profile[2], profile[3], profile[0]])
+        inside_wire = Part.makePolygon([profile[7], profile[6], profile[5], profile[4], profile[7]])
+        clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+    
+    # Return the clapboard shape without any clipping
+    # Clipping to wall and cutting holes happens AFTER all courses are fused
+    return clapboard_shape
+
+
+# Main execution
+if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins__':
+    doc = App.activeDocument()
+    if doc is None:
+        App.Console.PrintError("No active document!\n")
+    else:
+        sel = FreeCADGui.Selection.getSelection()
+        
+        if len(sel) == 0:
+            App.Console.PrintError("Please select one or more sketches!\n")
+        else:
+            # Filter to sketches with wires
+            sketches = [obj for obj in sel if hasattr(obj, 'Shape') and len(obj.Shape.Wires) > 0]
+            
+            if len(sketches) == 0:
+                App.Console.PrintError("No valid sketches selected!\n")
+            else:
+                # Get parameters
+                params = get_params_from_spreadsheet(doc)
+                
+                if params:
+                    App.Console.PrintMessage("Using parameters from spreadsheet\n")
+                    clapboard_height = params.get('clapboard_height', 0.8)
+                    clapboard_thickness = params.get('clapboard_thickness', 0.2)
+                    trim_width = params.get('trim_width', 1.5)
+                    trim_thickness = params.get('trim_thickness', 0.2)
+                    wall_thickness = params.get('wall_thickness', 2.0)
+                else:
+                    App.Console.PrintMessage("Using HO scale defaults\n")
+                    clapboard_height = 0.8
+                    clapboard_thickness = 0.2
+                    trim_width = 1.5
+                    trim_thickness = 0.2
+                    wall_thickness = 2.0
+                
+                if len(sketches) > 1:
+                    App.Console.PrintMessage(f"\n=== BATCH MODE: {len(sketches)} sketches ===\n")
+                
+                # Process each sketch
+                success_count = 0
+                fail_count = 0
+                
+                for sketch in sketches:
+                    try:
+                        wall_compound = create_clapboard_wall(
+                            sketch, clapboard_height, clapboard_thickness,
+                            trim_width, trim_thickness, wall_thickness
+                        )
+                        
+                        wall_obj = doc.addObject("Part::Feature", f"ClapboardWall_{sketch.Label}")
+                        wall_obj.Shape = wall_compound
+                        
+                        # Add metadata
+                        wall_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata")
+                        wall_obj.GeneratorName = GENERATOR_NAME
+                        wall_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata")
+                        wall_obj.GeneratorVersion = VERSION
+                        wall_obj.addProperty("App::PropertyString", "SourceSketch", "Metadata")
+                        wall_obj.SourceSketch = sketch.Label
+                        
+                        App.Console.PrintMessage(f"✓ '{wall_obj.Label}' created\n")
+                        success_count += 1
+                        
+                    except Exception as e:
+                        App.Console.PrintError(f"✗ Failed '{sketch.Label}': {e}\n")
+                        import traceback
+                        traceback.print_exc()
+                        fail_count += 1
+                
+                doc.recompute()
+                
+                App.Console.PrintMessage(f"\n=== SUMMARY: {success_count} succeeded, {fail_count} failed ===\n")
+                
+                try:
+                    import FreeCADGui
+                    FreeCADGui.activeDocument().activeView().viewAxonometric()
+                    FreeCADGui.SendMsgToActiveView("ViewFit")
+                except:
+                    pass
