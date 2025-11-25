@@ -1,16 +1,16 @@
 """
-Parametric Clapboard Siding Generator for FreeCAD v5.0.1
+Parametric Clapboard Siding Generator for FreeCAD v5.1.0
 Generates realistic clapboard siding from explicitly selected FACES
 
 Author: Generated for model railroading (HO/O/N scale)
 Usage: Click on specific faces in the 3D view, then run this macro
 
 Version History:
+- 5.1.0: REMOVE: Trim logic (defer to smart_trim generator)
+         CHANGE: Fuse clapboards directly to source wall (boolean now, validate early)
+         REMOVE: trim_width and trim_thickness parameters
 - 5.0.1: ADD: Sketch geometry validation - detect degenerate and duplicate edges
 - 5.0.0: REWRITE - Face-based selection (not sketches)
-         User clicks on specific faces they want clapboards on
-         Works with faces from solids, compounds, extrusions, arrays, anything
-         Hardcoded clapboard trim offset (0.05mm) to prevent coplanar faces
 """
 
 import FreeCAD as App
@@ -18,7 +18,7 @@ import Part
 from FreeCAD import Vector
 import math
 
-VERSION = "5.0.1"
+VERSION = "5.1.0"
 GENERATOR_NAME = "clapboard_generator"
 CLAPBOARD_TRIM_OFFSET = 0.05  # mm - Keep clapboard bottom slightly inboard of trim to avoid coplanar faces
 
@@ -51,9 +51,6 @@ def get_params_from_spreadsheet(doc):
     param_map = {
         'clapboard_height': ['clapboard_height', 'ClapboardHeight', 'clapboardHeight', 'reveal'],
         'clapboard_thickness': ['clapboard_thickness', 'ClapboardThickness', 'thickness', 'materialThickness'],
-        'trim_width': ['trim_width', 'TrimWidth'],
-        'trim_thickness': ['trim_thickness', 'TrimThickness', 'materialThickness'],
-        'wall_thickness': ['wall_thickness', 'wallThickness', 'WallThickness'],
     }
     
     for param_key, possible_names in param_map.items():
@@ -70,12 +67,9 @@ def get_params_from_spreadsheet(doc):
 
 
 def check_for_degenerate_edges(wire):
-    """
-    Detect edges with zero or near-zero length.
-    Returns list of (index, length) tuples for degenerate edges.
-    """
+    """Detect edges with zero or near-zero length."""
     degenerate = []
-    tolerance = 0.001  # mm - anything shorter is degenerate
+    tolerance = 0.001  # mm
     
     for i, edge in enumerate(wire.Edges):
         if edge.Length < tolerance:
@@ -85,10 +79,7 @@ def check_for_degenerate_edges(wire):
 
 
 def check_for_duplicate_edges(wire):
-    """
-    Detect duplicate or overlapping edges in a wire.
-    Returns list of (index1, index2) tuples for duplicate edges.
-    """
+    """Detect duplicate or overlapping edges in a wire."""
     edges = wire.Edges
     duplicates = []
     tolerance = 0.001  # mm
@@ -103,12 +94,9 @@ def check_for_duplicate_edges(wire):
             e2_start = edge2.valueAt(edge2.FirstParameter)
             e2_end = edge2.valueAt(edge2.LastParameter)
             
-            # Same edge in same direction
             if (e1_start.distanceToPoint(e2_start) < tolerance and
                 e1_end.distanceToPoint(e2_end) < tolerance):
                 duplicates.append((i, j))
-            
-            # Same edge reversed
             elif (e1_start.distanceToPoint(e2_end) < tolerance and
                   e1_end.distanceToPoint(e2_start) < tolerance):
                 duplicates.append((i, j))
@@ -117,11 +105,7 @@ def check_for_duplicate_edges(wire):
 
 
 def validate_wire_geometry(wire, wire_name="Wire"):
-    """
-    Validate wire for common geometry errors.
-    Raises ValueError if critical issues found.
-    """
-    # Check for degenerate edges
+    """Validate wire for common geometry errors."""
     degenerate = check_for_degenerate_edges(wire)
     if degenerate:
         errors = [f"  Edge {i}: length={length:.6f}mm" for i, length in degenerate]
@@ -132,7 +116,6 @@ def validate_wire_geometry(wire, wire_name="Wire"):
             "Check for stray geometry in the Sketcher!"
         )
     
-    # Check for duplicate edges
     duplicates = check_for_duplicate_edges(wire)
     if duplicates:
         errors = [f"  Edges {i} and {j}" for i, j in duplicates]
@@ -145,24 +128,10 @@ def validate_wire_geometry(wire, wire_name="Wire"):
 
 
 def get_selected_faces():
-    """
-    Get explicitly selected faces from FreeCAD selection.
-    User must click on specific faces in the 3D view (not whole objects).
-    
-    Uses getSelectionEx() to detect sub-element (face) selections.
-    Only processes faces the user explicitly clicked on.
-    
-    Returns:
-        List of (object, face, face_index) tuples
-    
-    Raises:
-        ValueError: If no faces are explicitly selected
-    """
+    """Get explicitly selected faces from FreeCAD selection."""
     import FreeCADGui
     
     faces_list = []
-    
-    # Get selection with sub-element information
     selection_ex = FreeCADGui.Selection.getSelectionEx()
     
     if len(selection_ex) == 0:
@@ -175,14 +144,11 @@ def get_selected_faces():
             print(f"Warning: '{obj.Label}' has no Shape property")
             continue
         
-        # Check if specific sub-elements (faces) are selected
         if len(sel_obj.SubElementNames) > 0:
-            # User selected specific faces - process only those
             for sub_name in sel_obj.SubElementNames:
                 if sub_name.startswith('Face'):
                     try:
-                        # Extract face number from "Face1", "Face2", etc. (1-indexed in FreeCAD)
-                        face_num = int(sub_name[4:]) - 1  # Convert to 0-indexed
+                        face_num = int(sub_name[4:]) - 1
                         
                         if face_num < len(obj.Shape.Faces):
                             face = obj.Shape.Faces[face_num]
@@ -193,7 +159,6 @@ def get_selected_faces():
                     except ValueError:
                         print(f"Warning: Could not parse face number from '{sub_name}'")
         else:
-            # No sub-elements selected - user clicked on object itself, not specific faces
             raise ValueError(
                 f"Please select specific FACES, not the whole object!\n"
                 f"Click in the 3D view to select '{obj.Label}',\n"
@@ -213,23 +178,18 @@ def get_face_wires(face):
     if len(wires) == 0:
         raise ValueError("Face has no wires!")
     
-    # Find outer wire (largest area)
     outer_wire = max(wires, key=lambda w: abs(Part.Face(w).Area))
     hole_wires = [w for w in wires if w != outer_wire]
     
-    # Validate that outer wire is closed
     if not outer_wire.isClosed():
         raise ValueError("Outer wire is not closed! Cannot generate clapboards.")
     
-    # Validate hole wires are closed
     for i, hw in enumerate(hole_wires):
         if not hw.isClosed():
             raise ValueError(f"Hole wire {i} is not closed!")
     
-    # Validate geometry of outer wire
     validate_wire_geometry(outer_wire, "Outer wire")
     
-    # Validate geometry of hole wires
     for i, hw in enumerate(hole_wires):
         validate_wire_geometry(hw, f"Hole wire {i}")
     
@@ -242,7 +202,7 @@ def get_face_bounding_box_local(face):
 
 
 def get_face_normal(face):
-    """Get the normal vector of a face at its center (in local coordinates)."""
+    """Get the normal vector of a face at its center."""
     u_range = face.ParameterRange[:2]
     v_range = face.ParameterRange[2:]
     u_mid = (u_range[0] + u_range[1]) / 2
@@ -257,20 +217,15 @@ def detect_face_orientation(bbox):
     y_extent = bbox.YMax - bbox.YMin
     z_extent = bbox.ZMax - bbox.ZMin
     
-    tolerance = 0.1  # Face is "flat" if extent < tolerance
+    tolerance = 0.1
     
-    # Check which axis has near-zero extent (that's the normal direction)
     if x_extent < tolerance:
-        # YZ plane (normal is X)
         return 'z', 'y', 'x'
     elif y_extent < tolerance:
-        # XZ plane (normal is Y)
         return 'z', 'x', 'y'
     elif z_extent < tolerance:
-        # XY plane (normal is Z)
         return 'y', 'x', 'z'
     else:
-        # All three have extent - face is tilted
         if z_extent >= y_extent and z_extent >= x_extent:
             if x_extent > y_extent:
                 return 'z', 'x', 'y'
@@ -278,57 +233,6 @@ def detect_face_orientation(bbox):
                 return 'z', 'y', 'x'
         else:
             return 'y', 'x', 'z'
-
-
-def is_building_corner(edge, bbox, vertical_axis='y', horizontal_axis='x', tolerance=1.0):
-    """Check if a vertical edge is at a building corner (extreme position)."""
-    try:
-        edge_start = edge.valueAt(edge.FirstParameter)
-        edge_end = edge.valueAt(edge.LastParameter)
-        
-        if horizontal_axis == 'x':
-            h_pos = edge_start.x
-            h_min = bbox.XMin
-            h_max = bbox.XMax
-        else:
-            h_pos = edge_start.y
-            h_min = bbox.YMin
-            h_max = bbox.YMax
-        
-        at_min = abs(h_pos - h_min) < tolerance
-        at_max = abs(h_pos - h_max) < tolerance
-        
-        return at_min or at_max
-        
-    except Exception as e:
-        print(f"Warning: Could not check if edge is at corner: {e}")
-        return False
-
-
-def find_vertical_edges(wire, vertical_axis='y'):
-    """Find edges parallel to the vertical axis."""
-    vertical_edges = []
-    
-    for edge in wire.Edges:
-        if edge.Length < 0.01:
-            continue
-        
-        try:
-            direction = edge.tangentAt(edge.FirstParameter)
-            direction.normalize()
-            
-            if vertical_axis == 'z':
-                is_vertical = abs(abs(direction.z) - 1.0) < 0.01
-            else:
-                is_vertical = abs(abs(direction.y) - 1.0) < 0.01
-            
-            if is_vertical:
-                vertical_edges.append(edge)
-        
-        except Exception as e:
-            print(f"Warning: Could not analyze edge: {e}")
-    
-    return vertical_edges
 
 
 def find_gable_edges(wire, vertical_axis='y', angle_tolerance=5.0):
@@ -359,69 +263,6 @@ def find_gable_edges(wire, vertical_axis='y', angle_tolerance=5.0):
             print(f"Warning: Could not analyze edge: {e}")
     
     return gable_edges
-
-
-def create_trim_board_local(edge, thickness, width, vertical_axis, horizontal_axis, bbox, normal):
-    """Create a trim board along a vertical edge."""
-    edge_start = edge.valueAt(edge.FirstParameter)
-    edge_end = edge.valueAt(edge.LastParameter)
-    
-    if vertical_axis == 'z':
-        if edge_end.z < edge_start.z:
-            edge_start, edge_end = edge_end, edge_start
-    else:
-        if edge_end.y < edge_start.y:
-            edge_start, edge_end = edge_end, edge_start
-    
-    if vertical_axis == 'z':
-        if horizontal_axis == 'x':
-            x_pos = edge_start.x
-            y_offset = thickness if normal.y > 0 else -thickness
-            
-            profile = [
-                Vector(x_pos - width/2, bbox.YMin, edge_start.z),
-                Vector(x_pos + width/2, bbox.YMin, edge_start.z),
-                Vector(x_pos + width/2, bbox.YMin, edge_end.z),
-                Vector(x_pos - width/2, bbox.YMin, edge_end.z),
-                Vector(x_pos - width/2, bbox.YMin, edge_start.z)
-            ]
-            
-            profile_wire = Part.makePolygon(profile)
-            profile_face = Part.Face(profile_wire)
-            trim = profile_face.extrude(Vector(0, y_offset, 0))
-            
-        else:
-            y_pos = edge_start.y
-            x_offset = thickness if normal.x > 0 else -thickness
-            
-            profile = [
-                Vector(bbox.XMin, y_pos - width/2, edge_start.z),
-                Vector(bbox.XMin, y_pos + width/2, edge_start.z),
-                Vector(bbox.XMin, y_pos + width/2, edge_end.z),
-                Vector(bbox.XMin, y_pos - width/2, edge_end.z),
-                Vector(bbox.XMin, y_pos - width/2, edge_start.z)
-            ]
-            
-            profile_wire = Part.makePolygon(profile)
-            profile_face = Part.Face(profile_wire)
-            trim = profile_face.extrude(Vector(x_offset, 0, 0))
-    else:
-        x_pos = edge_start.x
-        z_offset = thickness if normal.z > 0 else -thickness
-        
-        profile = [
-            Vector(x_pos - width/2, edge_start.y, 0),
-            Vector(x_pos + width/2, edge_start.y, 0),
-            Vector(x_pos + width/2, edge_end.y, 0),
-            Vector(x_pos - width/2, edge_end.y, 0),
-            Vector(x_pos - width/2, edge_start.y, 0)
-        ]
-        
-        profile_wire = Part.makePolygon(profile)
-        profile_face = Part.Face(profile_wire)
-        trim = profile_face.extrude(Vector(0, 0, z_offset))
-    
-    return trim
 
 
 def create_clapboard_course_local(vert_position, bbox, clapboard_height, clapboard_thickness,
@@ -523,45 +364,23 @@ def create_clapboard_course_local(vert_position, bbox, clapboard_height, clapboa
     return clapboard_shape
 
 
-def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_thickness=0.2,
-                         trim_width=1.5, trim_thickness=0.2, wall_thickness=2.0):
-    """Generate clapboard siding from a face."""
+def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_thickness=0.2):
+    """Generate clapboard siding from a face and fuse to source wall."""
     print(f"\nGenerating clapboards for face from '{source_object.Label}' (v{VERSION})...")
     
-    # Get wires from face (with geometry validation)
     outer_wire, hole_wires = get_face_wires(face)
     
-    # Get bounding box
     bbox = get_face_bounding_box_local(face)
     print(f"Face bounds: X=[{bbox.XMin:.1f}, {bbox.XMax:.1f}], "
           f"Y=[{bbox.YMin:.1f}, {bbox.YMax:.1f}], Z=[{bbox.ZMin:.1f}, {bbox.ZMax:.1f}]")
     
-    # Detect orientation
     vertical_axis, horizontal_axis, plane_normal = detect_face_orientation(bbox)
     print(f"Orientation: vertical={vertical_axis}, horizontal={horizontal_axis}")
     
-    # Get face normal
     normal = get_face_normal(face)
     print(f"Face normal (local): ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
     
     parts = []
-    
-    # Create trim boards
-    print("Creating trim boards...")
-    vertical_edges = find_vertical_edges(outer_wire, vertical_axis)
-    trim_count = 0
-    
-    for edge in vertical_edges:
-        if is_building_corner(edge, bbox, vertical_axis, horizontal_axis):
-            try:
-                trim = create_trim_board_local(edge, trim_thickness, trim_width, 
-                                              vertical_axis, horizontal_axis, bbox, normal)
-                parts.append(trim)
-                trim_count += 1
-            except Exception as e:
-                print(f"Warning: Failed to create trim: {e}")
-    
-    print(f"Created {trim_count} trim boards")
     
     # Create clapboard courses
     print("Creating clapboard courses...")
@@ -594,20 +413,16 @@ def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_t
     print(f"Created {successful}/{num_courses} courses")
     
     if len(parts) == 0:
-        raise RuntimeError("No parts created!")
+        raise RuntimeError("No clapboard courses created!")
     
-    # Create structural wall
-    print(f"Creating structural wall ({wall_thickness:.2f}mm)...")
-    structural_wall = face.extrude(normal * -wall_thickness)
-    
-    # Fuse all parts
-    print("Fusing parts...")
+    # Fuse all clapboard courses
+    print("Fusing clapboard courses...")
     if len(parts) == 1:
-        fused_exterior = parts[0]
+        fused_clapboards = parts[0]
     else:
-        fused_exterior = parts[0].fuse(parts[1:])
+        fused_clapboards = parts[0].fuse(parts[1:])
     
-    combined = structural_wall.fuse(fused_exterior)
+    print(f"Fused clapboards volume: {fused_clapboards.Volume:.2f} mm³")
     
     # Check for gable edges
     print("Checking for gable edges...")
@@ -617,27 +432,27 @@ def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_t
         print(f"Found {len(gable_edges)} gable edges - cutting profile...")
         try:
             gable_solid_out = face.extrude(normal * clapboard_thickness * 3)
-            gable_solid_in = face.extrude(normal * -wall_thickness)
+            gable_solid_in = face.extrude(normal * -(clapboard_thickness * 2))
             gable_solid = gable_solid_out.fuse(gable_solid_in)
-            combined = combined.common(gable_solid)
+            fused_clapboards = fused_clapboards.common(gable_solid)
         except Exception as e:
             print(f"Warning: Gable cutting failed: {e}")
     
     # Cut holes
     print(f"Cutting {len(hole_wires)} holes...")
-    final_result = combined
+    final_clapboards = fused_clapboards
     
     holes_cut = 0
     for i, hole_wire in enumerate(hole_wires):
         try:
             hole_face = Part.Face(hole_wire)
             hole_volume_fwd = hole_face.extrude(normal * clapboard_thickness * 2)
-            hole_volume_back = hole_face.extrude(normal * -(wall_thickness + clapboard_thickness * 2))
+            hole_volume_back = hole_face.extrude(normal * -(clapboard_thickness * 3))
             hole_volume = hole_volume_fwd.fuse(hole_volume_back)
             
-            volume_before = final_result.Volume
-            final_result = final_result.cut(hole_volume)
-            volume_after = final_result.Volume
+            volume_before = final_clapboards.Volume
+            final_clapboards = final_clapboards.cut(hole_volume)
+            volume_after = final_clapboards.Volume
             
             if volume_before - volume_after > 0.001:
                 holes_cut += 1
@@ -647,7 +462,14 @@ def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_t
     
     print(f"Cut {holes_cut}/{len(hole_wires)} holes")
     
-    return final_result
+    # Fuse clapboards to source wall
+    print(f"\nFusing clapboards to source wall '{source_object.Label}'...")
+    try:
+        combined = source_object.Shape.fuse(final_clapboards)
+        print(f"Fused result volume: {combined.Volume:.2f} mm³")
+        return combined
+    except Exception as e:
+        raise RuntimeError(f"Failed to fuse clapboards to source wall: {e}")
 
 
 # Main execution
@@ -665,43 +487,33 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
         if len(faces_list) == 0:
             App.Console.PrintError("No faces selected!\n")
         else:
-            # Get parameters
             params = get_params_from_spreadsheet(doc)
             
             if params:
                 App.Console.PrintMessage("Using parameters from spreadsheet\n")
                 clapboard_height = params.get('clapboard_height', 0.8)
                 clapboard_thickness = params.get('clapboard_thickness', 0.2)
-                trim_width = params.get('trim_width', 1.5)
-                trim_thickness = params.get('trim_thickness', 0.2)
-                wall_thickness = params.get('wall_thickness', 2.0)
             else:
                 App.Console.PrintMessage("Using HO scale defaults\n")
                 clapboard_height = 0.8
                 clapboard_thickness = 0.2
-                trim_width = 1.5
-                trim_thickness = 0.2
-                wall_thickness = 2.0
             
             if len(faces_list) > 1:
                 App.Console.PrintMessage(f"\n=== Processing {len(faces_list)} faces ===\n")
             
-            # Process each face
             success_count = 0
             fail_count = 0
             
             for source_obj, face, face_idx in faces_list:
                 try:
                     wall_compound = create_clapboard_wall(
-                        face, source_obj, clapboard_height, clapboard_thickness,
-                        trim_width, trim_thickness, wall_thickness
+                        face, source_obj, clapboard_height, clapboard_thickness
                     )
                     
                     wall_obj = doc.addObject("Part::Feature", 
                                             f"ClapboardWall_{source_obj.Label}_F{face_idx}")
                     wall_obj.Shape = wall_compound
                     
-                    # Add metadata
                     wall_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata")
                     wall_obj.GeneratorName = GENERATOR_NAME
                     wall_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata")
