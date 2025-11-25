@@ -1,11 +1,14 @@
 """
-Parametric Clapboard Siding Generator for FreeCAD v4.2.0
+Parametric Clapboard Siding Generator for FreeCAD v4.3.0
 Generates realistic clapboard siding from a sketch defining wall outline and openings
 
 Author: Generated for model railroading (HO/O/N scale)
 Usage: Select one or more sketches, run as macro in FreeCAD
 
 Version History:
+- 4.3.0: FIX: Transform face normal from sketch local to global coordinates (fixes wrong-side clapboards)
+         FIX: Validate that selections are actual Sketch objects, not Extrusions (prevents empty geometry)
+         IMPROVE: Better error messages when non-sketch objects are selected
 - 4.2.0: ADD: Closed wire validation to catch sketch errors early
          FIX: Replace thin carrier with proper structural wall using wallThickness parameter
          Structural wall extrudes inward, clapboards extrude outward
@@ -32,7 +35,7 @@ import Part
 from FreeCAD import Vector
 import math
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 GENERATOR_NAME = "clapboard_generator"
 
 
@@ -86,6 +89,40 @@ def get_params_from_spreadsheet(doc):
                 continue
     
     return params if params else None
+
+
+def validate_sketch(obj):
+    """
+    Validate that an object is actually a Sketch, not an Extrusion or other object.
+    Provides helpful error messages.
+    
+    Args:
+        obj: FreeCAD object to validate
+    
+    Returns:
+        True if valid sketch
+    
+    Raises:
+        ValueError: If object is not a valid sketch with helpful error message
+    """
+    # Check if it's a sketch object
+    if not hasattr(obj, 'TypeId') or obj.TypeId != 'Sketcher::SketchObject':
+        if obj.TypeId == 'Part::Extrusion':
+            raise ValueError(
+                f"Selected '{obj.Label}' is an Extrusion, not a Sketch!\n"
+                f"Please select the BASE SKETCH ('{obj.Base.Label}'), not the extrusion."
+            )
+        else:
+            raise ValueError(
+                f"Selected '{obj.Label}' is a {obj.TypeId}, not a Sketch!\n"
+                f"Please select a Sketch object."
+            )
+    
+    # Check if sketch has geometry
+    if not hasattr(obj, 'Shape') or len(obj.Shape.Wires) == 0:
+        raise ValueError(f"Sketch '{obj.Label}' has no wires/geometry!")
+    
+    return True
 
 
 def get_sketch_wires(sketch):
@@ -163,24 +200,33 @@ def is_building_corner(edge, bbox, vertical_axis='y', horizontal_axis='x', toler
         return False
 
 
-def get_face_normal(face):
+def get_face_normal(face, sketch_placement=None):
     """
     Get the normal vector of a face at its center.
+    If sketch_placement is provided, transforms the normal from sketch local
+    coordinates to global coordinates.
     
     Args:
         face: Part.Face object
+        sketch_placement: Optional FreeCAD.Placement for sketch (to transform from local to global)
     
     Returns:
-        Vector: Normal vector (unit length)
+        Vector: Normal vector (unit length) in global coordinates if sketch_placement provided,
+                otherwise in local coordinates
     """
     # Sample at the center of the face's parameter space
     u_range = face.ParameterRange[:2]
     v_range = face.ParameterRange[2:]
     u_mid = (u_range[0] + u_range[1]) / 2
     v_mid = (v_range[0] + v_range[1]) / 2
-    normal = face.normalAt(u_mid, v_mid)
+    normal_local = face.normalAt(u_mid, v_mid)
     
-    return normal
+    # Transform to global coordinates if placement provided
+    if sketch_placement is not None:
+        normal_global = sketch_placement.Rotation.multVec(normal_local)
+        return normal_global
+    
+    return normal_local
 
 
 def find_gable_edges(wire, vertical_axis='y', angle_tolerance=5.0):
@@ -247,6 +293,9 @@ def create_clapboard_wall(sketch, clapboard_height=0.8, clapboard_thickness=0.2,
     """
     print(f"\nGenerating clapboards for '{sketch.Label}' (generator v{VERSION})...")
     
+    # Validate that this is actually a sketch
+    validate_sketch(sketch)
+    
     # Get wires in LOCAL sketch coordinates - validates that wires are closed
     outer_wire, hole_wires = get_sketch_wires(sketch)
     
@@ -308,9 +357,10 @@ def create_clapboard_wall(sketch, clapboard_height=0.8, clapboard_thickness=0.2,
     wall_face = Part.Face(outer_wire)
     holes_faces = [Part.Face(hw) for hw in hole_wires]
     
-    # Get face normal - this determines extrusion direction
-    normal = get_face_normal(wall_face)
-    print(f"Wall face normal: ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
+    # Get face normal - TRANSFORMED to global coordinates using sketch placement
+    # This is critical for rotated sketches (XZ, YZ planes) to get correct direction
+    normal = get_face_normal(wall_face, sketch.Placement)
+    print(f"Wall face normal (global coords): ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
     
     parts = []
     
@@ -726,11 +776,26 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
         if len(sel) == 0:
             App.Console.PrintError("Please select one or more sketches!\n")
         else:
-            # Filter to sketches with wires
-            sketches = [obj for obj in sel if hasattr(obj, 'Shape') and len(obj.Shape.Wires) > 0]
+            # Validate and filter to actual Sketch objects
+            sketches = []
+            invalid_objects = []
+            
+            for obj in sel:
+                try:
+                    validate_sketch(obj)
+                    sketches.append(obj)
+                except ValueError as e:
+                    invalid_objects.append((obj, str(e)))
+            
+            # Report any invalid selections
+            if invalid_objects:
+                App.Console.PrintError("\n=== INVALID SELECTIONS ===\n")
+                for obj, error in invalid_objects:
+                    App.Console.PrintError(f"✗ {error}\n")
             
             if len(sketches) == 0:
-                App.Console.PrintError("No valid sketches selected!\n")
+                App.Console.PrintError("\nNo valid sketches selected!\n")
+                App.Console.PrintError("Please select Sketch objects, not Extrusions or other objects.\n")
             else:
                 # Get parameters
                 params = get_params_from_spreadsheet(doc)
