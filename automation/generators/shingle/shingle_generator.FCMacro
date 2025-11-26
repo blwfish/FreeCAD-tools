@@ -1,0 +1,537 @@
+"""
+Parametric Shingle Generator for FreeCAD v4.0.0
+Generates realistic shingles on roof surfaces from selected faces
+
+Author: Brian (with Claude assistance)
+Usage: Select one or more roof faces, run as macro in FreeCAD
+
+Version History:
+- 4.0.0: MAJOR REFACTOR - Extract geometry to shingle_geometry.py
+         Face-based selection (match clapboard v5.2.0 pattern)
+         Add comprehensive parameter and face validation
+         Separate geometry logic from FreeCAD I/O
+- 3.6.3: Previous version with all geometry inline
+
+Requires: shingle_geometry.py in same directory as macro
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+import math
+import sys
+import os
+
+# Import geometry library
+try:
+    import sys
+    import os
+    # Add _lib directory to path so we can import geometry modules
+    macro_dir = os.path.dirname(__file__)
+    lib_dir = os.path.join(macro_dir, "_lib")
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    
+    from shingle_geometry import (
+        validate_parameters,
+        validate_stagger_pattern,
+        calculate_layout,
+        calculate_stagger_offset,
+        validate_face_for_shingling,
+        calculate_face_bounds,
+        detect_face_orientation,
+        get_orientation_description,
+        calculate_shingle_position,
+        validate_collar_margin,
+    )
+except ImportError as e:
+    print(f"ERROR: Could not import shingle_geometry.py: {e}")
+    print("Make sure shingle_geometry.py is in the _lib subdirectory of your Macro folder")
+    sys.exit(1)
+
+VERSION = "4.0.0"
+GENERATOR_NAME = "shingle_generator"
+
+
+def find_spreadsheet(doc, preferred_names):
+    """
+    Find spreadsheet by checking both object name and label.
+    """
+    for ss_name in preferred_names:
+        # Try by object name first
+        obj = doc.getObject(ss_name)
+        if obj and obj.TypeId == 'Spreadsheet::Sheet':
+            print(f"Found spreadsheet by name: '{ss_name}'")
+            return obj
+        
+        # Try by label
+        for obj in doc.Objects:
+            if obj.TypeId == 'Spreadsheet::Sheet' and obj.Label == ss_name:
+                print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
+                return obj
+    
+    return None
+
+
+def get_params_from_spreadsheet(doc):
+    """
+    Try to read shingle parameters from spreadsheet.
+    """
+    preferred_names = ["params", "ShingleParameters", "BuildingParameters", "Spreadsheet"]
+    
+    ss = find_spreadsheet(doc, preferred_names)
+    if ss is None:
+        return None
+    
+    params = {}
+    param_map = {
+        'shingleWidth': ['shingleWidth', 'ShingleWidth', 'shingle_width'],
+        'shingleHeight': ['shingleHeight', 'ShingleHeight', 'shingle_height'],
+        'materialThickness': ['materialThickness', 'MaterialThickness', 'thickness'],
+        'shingleExposure': ['shingleExposure', 'ShingleExposure', 'shingle_exposure', 'exposure'],
+        'shingleStaggerPattern': ['shingleStaggerPattern', 'StaggerPattern', 'stagger_pattern'],
+        'shingleWedgeThickness': ['shingleWedgeThickness', 'WedgeThickness', 'wedge_thickness'],
+    }
+    
+    for param_key, possible_names in param_map.items():
+        for name in possible_names:
+            try:
+                val = ss.get(name)
+                if val is not None:
+                    # Try to convert to float, except for string parameter
+                    if param_key == 'shingleStaggerPattern':
+                        # Strip quotes and whitespace from string values
+                        params[param_key] = str(val).strip().strip("'\"").lower()
+                    else:
+                        params[param_key] = float(val)
+                    break
+            except:
+                continue
+    
+    return params if params else None
+
+
+def get_face_coordinate_system(face):
+    """
+    Extract coordinate system from a planar face.
+    
+    Returns:
+        tuple: (origin, u_vec, v_vec, normal, u_length, v_length)
+            origin: Corner point of face (lowest Z vertex)
+            u_vec: Unit vector along width (U direction)
+            v_vec: Unit vector along height (V direction)  
+            normal: Unit vector perpendicular to face
+            u_length: Length along U direction
+            v_length: Length along V direction
+    """
+    
+    # Get vertices - find the LOWEST vertex (lowest Z) to start at the eave
+    vertices = face.Vertexes
+    sorted_by_z = sorted(vertices, key=lambda v: v.Point.z)
+    origin = sorted_by_z[0].Point
+    
+    # Get edges to determine U and V directions
+    edges = face.Edges
+    
+    # Find edges that share the origin vertex
+    origin_edges = []
+    for edge in edges:
+        v1 = edge.Vertexes[0].Point
+        v2 = edge.Vertexes[1].Point
+        if v1.distanceToPoint(origin) < 0.001 or v2.distanceToPoint(origin) < 0.001:
+            origin_edges.append(edge)
+    
+    if len(origin_edges) < 2:
+        raise ValueError(f"Need at least 2 edges from origin, found {len(origin_edges)}")
+    
+    # Sort by length - for roofing:
+    # - U (width) should go across the roof (longer edge)
+    # - V (height) should go up the slope (shorter edge)
+    sorted_edges = sorted(origin_edges, key=lambda e: e.Length)
+    v_edge = sorted_edges[0]  # Shorter edge = up the slope (V/height)
+    u_edge = sorted_edges[1]  # Longer edge = across roof (U/width)
+    
+    # Get direction vectors from origin along the two edges
+    if u_edge.Vertexes[0].Point.distanceToPoint(origin) < 0.001:
+        u_vec = u_edge.Vertexes[1].Point.sub(u_edge.Vertexes[0].Point).normalize()
+    else:
+        u_vec = u_edge.Vertexes[0].Point.sub(u_edge.Vertexes[1].Point).normalize()
+    
+    if v_edge.Vertexes[0].Point.distanceToPoint(origin) < 0.001:
+        v_vec = v_edge.Vertexes[1].Point.sub(v_edge.Vertexes[0].Point).normalize()
+    else:
+        v_vec = v_edge.Vertexes[0].Point.sub(v_edge.Vertexes[1].Point).normalize()
+    
+    # Ensure V vector points UP the slope (positive Z component for sloped roofs)
+    if v_vec.z < 0:
+        v_vec = App.Vector(-v_vec.x, -v_vec.y, -v_vec.z)
+    
+    # Get normal from face
+    normal = face.normalAt(0.5, 0.5).normalize()
+    
+    # Get edge lengths
+    u_length = u_edge.Length
+    v_length = v_edge.Length
+    
+    return origin, u_vec, v_vec, normal, u_length, v_length
+
+
+def scale_vector(vec, scale):
+    """Properly scale a vector by component multiplication"""
+    return App.Vector(vec.x * scale, vec.y * scale, vec.z * scale)
+
+
+def generate_shingles(face, object_name, params):
+    """
+    Generate shingles on a face.
+    
+    Args:
+        face: The face to cover with shingles
+        object_name: Name of the source object (for metadata)
+        params: Dictionary with parameters:
+            - shingleWidth: Width of each shingle (mm)
+            - shingleHeight: Height of each shingle (mm)
+            - materialThickness: Thickness of material (mm)
+            - shingleExposure: Exposed portion per course (mm)
+            - shingleStaggerPattern: "half", "third", or "none"
+            - shingleWedgeThickness: Base thickness of triangular wedges (mm)
+    
+    Returns:
+        Part::Feature object containing the shingle compound
+    """
+    
+    doc = App.ActiveDocument
+    
+    # Extract parameters
+    shingle_width = params.get('shingleWidth', 10.0)
+    shingle_height = params.get('shingleHeight', 20.0)
+    shingle_thickness = params.get('materialThickness', 0.5)
+    exposure = params.get('shingleExposure', 15.0)
+    stagger_pattern = params.get('shingleStaggerPattern', 'half')
+    wedge_thickness = params.get('shingleWedgeThickness', shingle_thickness)
+    
+    print(f"\n{'='*60}")
+    print(f"Shingle Generator v{VERSION}")
+    print(f"{'='*60}")
+    print(f"Source: {object_name}")
+    print(f"Shingle: {shingle_width} x {shingle_height} x {shingle_thickness} mm")
+    print(f"Wedge base: {wedge_thickness} mm")
+    print(f"Exposure: {exposure} mm")
+    print(f"Stagger: {stagger_pattern}\n")
+    
+    # Get face coordinate system
+    origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
+    
+    # Check face normal direction - should point inward (downward for typical roofs)
+    # If normal Z component is positive, flip the normal
+    if normal.z > 0:
+        normal = normal.multiply(-1)
+        print(f"  ⚠ Flipped face normal to point inward\n")
+    
+    print(f"Face dimensions: {u_length:.1f} x {v_length:.1f} mm")
+    
+    # Use geometry library to calculate layout
+    layout = calculate_layout(u_length, v_length, shingle_width, exposure, stagger_pattern)
+    
+    num_courses = layout['num_courses']
+    shingles_per_course = layout['shingles_per_course']
+    max_stagger = layout['max_stagger']
+    
+    print(f"Courses: {num_courses}")
+    print(f"Shingles per course: {shingles_per_course}")
+    print(f"Total (before trimming): {num_courses * shingles_per_course}\n")
+    
+    # Generate shingles with solid trapezoid geometry
+    shingle_shapes = []
+    
+    # Create clipping volume based on face geometry
+    # Extrude the face to create a 3D clipping volume that respects face orientation
+    clip_margin = shingle_thickness * 2  # Allow small overhang for material thickness
+    
+    try:
+        # Extrude face inward and outward to create clipping volume
+        extrusion_depth = 100.0  # Large enough to capture all shingles
+        clip_volume_pos = face.extrude(normal.multiply(extrusion_depth))
+        clip_volume_neg = face.extrude(normal.multiply(-extrusion_depth))
+        clip_volume = clip_volume_pos.fuse(clip_volume_neg)
+        
+        print(f"✓ Face-based clipping volume created\n")
+    except Exception as e:
+        print(f"Warning: Could not create face clipping volume: {e}")
+        print(f"Proceeding without per-shingle clipping\n")
+        clip_volume = None
+    
+    for row in range(num_courses):
+        # Calculate stagger offset for this row (using geometry library)
+        stagger = calculate_stagger_offset(row, stagger_pattern, shingle_width)
+        
+        for col in range(shingles_per_course):
+            # Start before origin to ensure full coverage
+            u = col * shingle_width + stagger - max_stagger
+            v = row * exposure - exposure  # Start one course below origin
+            
+            # Calculate base position (top edge of shingle on roof surface)
+            u_scaled = scale_vector(u_vec, u)
+            v_scaled = scale_vector(v_vec, v)
+            top_position = origin + u_scaled + v_scaled
+            
+            # Create shingle geometry based on row
+            if row == 0:
+                # Row 0: Rectangular box with exposed height only
+                shingle_shape = Part.makeBox(shingle_width, exposure, shingle_thickness)
+                
+                # Align to face
+                z_axis = App.Vector(0, 0, 1)
+                rot1 = App.Rotation(z_axis, normal)
+                x_after_rot1 = rot1.multVec(App.Vector(1, 0, 0))
+                rot2 = App.Rotation(x_after_rot1, u_vec)
+                final_rotation = rot2.multiply(rot1)
+                
+                shingle_shape.Placement = App.Placement(top_position, final_rotation)
+                
+            else:
+                # Row 1+: Triangular wedge cross-section
+                # Top edge: thin (wedge_thickness) against roof
+                # Bottom edge: tapers to a point
+                # Height: full shingle_height
+                
+                p1 = App.Vector(0, 0, 0)                      # Top back (against roof, uphill)
+                p2 = App.Vector(0, 0, wedge_thickness)        # Top front (visible surface, uphill)  
+                p3 = App.Vector(0, shingle_height, 0)         # Bottom point (tapers to roof surface)
+                
+                # Create edges connecting the points
+                l1 = Part.LineSegment(p1, p2)
+                l2 = Part.LineSegment(p2, p3)
+                l3 = Part.LineSegment(p3, p1)
+                
+                # Make wire from edges
+                profile_wire = Part.Wire([l1.toShape(), l2.toShape(), l3.toShape()])
+                
+                # Create face from wire
+                profile_face = Part.Face(profile_wire)
+                
+                # Extrude along shingle width
+                extrude_vector = App.Vector(shingle_width, 0, 0)
+                shingle_shape = profile_face.extrude(extrude_vector)
+                
+                # Position and orient on the roof
+                z_axis = App.Vector(0, 0, 1)
+                rot1 = App.Rotation(z_axis, normal)
+                x_after_rot1 = rot1.multVec(App.Vector(1, 0, 0))
+                rot2 = App.Rotation(x_after_rot1, u_vec)
+                final_rotation = rot2.multiply(rot1)
+                
+                shingle_shape.Placement = App.Placement(top_position, final_rotation)
+            
+            # Clip shingle to face boundary if clipping volume exists
+            if clip_volume is not None:
+                try:
+                    clipped_shingle = shingle_shape.common(clip_volume)
+                    # Only keep shingles with real geometry
+                    if clipped_shingle.Volume > 0.001:
+                        shingle_shapes.append(clipped_shingle)
+                    # else: shingle was completely outside bounds, skip it
+                except Exception as e:
+                    # If clipping fails, keep original (graceful degradation)
+                    if shingle_shape.Volume > 0.001:
+                        shingle_shapes.append(shingle_shape)
+            else:
+                # No clipping volume, use original
+                shingle_shapes.append(shingle_shape)
+    
+    print(f"Generated {len(shingle_shapes)} shingles\n")
+    
+    # Fuse all shingles into a single connected solid
+    print("Fusing shingles into single solid (this may take a minute)...")
+    
+    if len(shingle_shapes) == 0:
+        raise ValueError("No shingles generated!")
+    
+    # Batch approach: fuse in groups of 10, then fuse the groups
+    batch_size = 10
+    batches = []
+    
+    for i in range(0, len(shingle_shapes), batch_size):
+        batch = shingle_shapes[i:i+batch_size]
+        if len(batch) == 1:
+            batches.append(batch[0])
+        else:
+            batch_fused = batch[0]
+            for shingle in batch[1:]:
+                batch_fused = batch_fused.fuse(shingle)
+            batches.append(batch_fused)
+        
+        if (i + batch_size) % 50 == 0:
+            print(f"  Fused {i + batch_size}/{len(shingle_shapes)} shingles...")
+    
+    # Now fuse all batches together
+    print(f"  Fusing {len(batches)} batches...")
+    fused_shape = batches[0]
+    for i, batch in enumerate(batches[1:], 1):
+        fused_shape = fused_shape.fuse(batch)
+        if i % 5 == 0:
+            print(f"    Batch {i}/{len(batches)-1}...")
+    
+    print(f"✓ All shingles fused into single solid\n")
+    
+    # Validate the fused shape
+    if fused_shape.isNull() or fused_shape.Volume < 0.001:
+        raise ValueError(f"Fused shape is invalid! Volume: {fused_shape.Volume}")
+    
+    print(f"  Fused shape volume: {fused_shape.Volume:.1f} mm³")
+    
+    # Per-shingle clipping already removed overhang geometry
+    # No additional trimming needed - shingles are already clipped to face bounds
+    trimmed_compound = fused_shape
+    print("✓ Shingles clipped to face boundaries during generation\n")
+    
+    # Create result object
+    result_name = f"ShingledRoof_{object_name}"
+    result_obj = doc.addObject("Part::Feature", result_name)
+    result_obj.Shape = trimmed_compound
+    
+    # Add metadata
+    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator name")
+    result_obj.GeneratorName = GENERATOR_NAME
+    
+    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+    result_obj.GeneratorVersion = VERSION
+    
+    result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
+    result_obj.SourceObject = object_name
+    
+    doc.recompute()
+    
+    print(f"✓ Created: {result_name}")
+    return result_obj
+
+
+# ============================================================================
+# Main execution
+# ============================================================================
+
+if __name__ == "__main__":
+    
+    doc = App.ActiveDocument
+    
+    if not doc:
+        print("ERROR: No active document")
+    else:
+        print(f"\n{'='*60}")
+        print(f"Shingle Generator v{VERSION}")
+        print(f"{'='*60}\n")
+        
+        # Try to get parameters from spreadsheet
+        params_sheet = doc.getObject("Spreadsheet")
+        
+        if params_sheet:
+            try:
+                params = get_params_from_spreadsheet(doc)
+                if params:
+                    print("Loaded parameters from spreadsheet:")
+                    for key, val in params.items():
+                        print(f"  {key}: {val}")
+                    print()
+                else:
+                    print("Warning: Could not load parameters from spreadsheet, using defaults\n")
+                    params = {
+                        'shingleWidth': 10.0,
+                        'shingleHeight': 20.0,
+                        'materialThickness': 0.5,
+                        'shingleExposure': 15.0,
+                        'shingleStaggerPattern': 'half'
+                    }
+            except Exception as e:
+                print(f"Warning: {e}")
+                print("Using default parameters\n")
+                params = {
+                    'shingleWidth': 10.0,
+                    'shingleHeight': 20.0,
+                    'materialThickness': 0.5,
+                    'shingleExposure': 15.0,
+                    'shingleStaggerPattern': 'half'
+                }
+        else:
+            print("No spreadsheet found, using default parameters:")
+            params = {
+                'shingleWidth': 10.0,
+                'shingleHeight': 20.0,
+                'materialThickness': 0.5,
+                'shingleExposure': 15.0,
+                'shingleStaggerPattern': 'half'
+            }
+            for key, val in params.items():
+                print(f"  {key}: {val}")
+            print()
+        
+        # Validate parameters early
+        is_valid, errors = validate_parameters(
+            params['shingleWidth'],
+            params['shingleHeight'],
+            params['materialThickness'],
+            params['shingleExposure']
+        )
+        
+        if not is_valid:
+            print("ERROR: Invalid parameters:")
+            for error in errors:
+                print(f"  - {error}")
+            print()
+        else:
+            is_valid, msg = validate_stagger_pattern(params['shingleStaggerPattern'])
+            if not is_valid:
+                print(f"ERROR: {msg}\n")
+            else:
+                # Get selected faces
+                selection = Gui.Selection.getSelectionEx()
+                
+                if not selection:
+                    print("ERROR: No faces selected!")
+                    print("\nUsage:")
+                    print("1. Select one or more roof faces (Ctrl+click in 3D view)")
+                    print("2. Run this macro")
+                    print()
+                elif not selection[0].HasSubObjects:
+                    print("ERROR: Please select faces, not just objects")
+                    print("\nUsage:")
+                    print("1. Select one or more faces by Ctrl+clicking on roof surfaces")
+                    print("2. Run this macro")
+                    print()
+                else:
+                    # Process selected faces
+                    success_count = 0
+                    fail_count = 0
+                    
+                    for sel in selection:
+                        obj_name = sel.Object.Label
+                        
+                        for sub_element in sel.SubElementNames:
+                            if not sub_element.startswith("Face"):
+                                print(f"ERROR: '{sub_element}' is not a face, skipping\n")
+                                continue
+                            
+                            try:
+                                # Get the actual face object
+                                face_index = int(sub_element[4:]) - 1  # Face6 -> index 5
+                                face = sel.Object.Shape.Faces[face_index]
+                                
+                                print(f"\n{'='*60}")
+                                print(f"Processing: {obj_name} / {sub_element}")
+                                print(f"{'='*60}")
+                                
+                                # Generate shingles for this face
+                                result = generate_shingles(face, obj_name, params)
+                                
+                                print(f"\n✓ SUCCESS: Generated shingles for {obj_name}/{sub_element}\n")
+                                success_count += 1
+                                
+                            except Exception as e:
+                                print(f"\n✗ FAILED: {e}\n")
+                                fail_count += 1
+                                import traceback
+                                traceback.print_exc()
+                    
+                    print(f"\n{'='*60}")
+                    print(f"SUMMARY: {success_count} succeeded, {fail_count} failed")
+                    print(f"{'='*60}\n")
