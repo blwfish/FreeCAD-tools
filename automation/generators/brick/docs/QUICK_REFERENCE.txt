@@ -1,0 +1,177 @@
+================================================================================
+BRICK GENERATOR v3.0.0 - QUICK REFERENCE
+================================================================================
+
+INSTALL
+-------
+1. Copy brick_generator_macro.FCMacro and brick_geometry.py to:
+   ~/Library/Application Support/FreeCAD/Macro/ (macOS)
+   OR
+   %APPDATA%\FreeCAD\Macro\ (Windows)
+
+2. Create FreeCAD document with Spreadsheet named "Spreadsheet"
+
+3. Add these cells:
+   brickWidth     = 2.32
+   brickHeight    = 0.65
+   brickDepth     = 1.09
+   mortar         = 0.11
+   bondType       = "stretcher"
+   commonBondCount = 5
+
+USAGE
+-----
+1. Draw rectangular sketch (or select face)
+2. Macro → Recent macros → brick_generator_macro
+3. Watch console for SUCCESS message
+4. Result appears in tree as BrickedWall_*
+
+BOND PATTERNS
+-------------
+stretcher    - Each course offset by ½ brick (most common)
+english      - Alternating stretcher/header courses (strong)
+flemish      - Each course alternates individual bricks (decorative)
+common       - N stretcher courses then 1 header (flexible)
+             - Adjust commonBondCount parameter (default 5)
+
+PARAMETERS
+----------
+All read from spreadsheet cells:
+
+brickWidth          Brick width along wall (mm)      [default: 2.32]
+brickHeight         Brick height (constant) (mm)     [default: 0.65]
+brickDepth          Brick depth into wall (mm)       [default: 1.09]
+mortar              Joint thickness (mm)             [default: 0.11]
+bondType            Pattern type (text)              [default: stretcher]
+commonBondCount     For common bond only (int)       [default: 5]
+
+HO SCALE DEFAULTS (8" × 2.25" × 3.75" brick, 0.375" mortar)
+
+OPENINGS (WINDOWS/DOORS/ARCHES)
+-------------------------------
+Use the "punchout" method:
+1. Generate full wall with no openings
+2. Create sketch of opening outline
+3. Extrude sketch perpendicular to wall (50mm+ thick)
+4. Use Part → Boolean → Cut to remove from wall
+5. Works for any shape: rectangular, arched, irregular
+
+FACE SELECTION vs SKETCH
+------------------------
+Face selection   - Faster, more reliable, works on 3D objects
+Sketch selection - Good for reference, can have holes (ignored)
+
+PERFORMANCE
+-----------
+100×100 mm wall    < 1 sec
+500×500 mm wall    3-5 sec
+1000×1000 mm wall  10-15 sec
+2000×2000 mm wall  60+ sec (consider breaking into sections)
+
+Main bottleneck: Boolean fuse operation on large brick counts
+
+TROUBLESHOOTING
+---------------
+"Could not import brick_geometry"
+→ brick_geometry.py not in same directory as macro
+
+"Please select a sketch or face"
+→ Nothing selected before running macro
+
+"No active document"
+→ Create new document first
+
+"Macro is very slow"
+→ Either wait, or use larger mortar to reduce brick count
+
+CUSTOMIZATION
+-------------
+To model different bricks (e.g., 10" × 3" large bricks):
+1. Measure or research actual dimensions
+2. Calculate: scaled_mm = actual_inches * 25.4 / 87  (for HO)
+3. Update spreadsheet cells with new values
+4. Re-run macro
+
+TESTING
+-------
+Verify geometry library works:
+cd ~/Library/Application\ Support/FreeCAD/Macro/
+python -m pytest test_brick_geometry.py -v
+→ Should see: 30 passed
+
+METADATA PROPERTIES
+-------------------
+After generation, check Properties panel:
+GeneratorName       = "brick_generator"
+GeneratorVersion    = "3.0.0"
+SourceObject        = Original sketch/object name
+SourceFace          = (face workflow) Face name
+BondType            = Pattern used
+BrickCount          = Total individual bricks
+
+COMMON TASKS
+------------
+Different bond pattern:
+  1. Edit spreadsheet: bondType = "english"
+  2. Select sketch/face again
+  3. Re-run macro
+
+Add windows to wall:
+  1. Generate full wall
+  2. Create window outline sketch
+  3. Extrude it
+  4. Part → Boolean → Cut from wall
+
+Break large wall into sections:
+  1. Generate two 500mm walls separately
+  2. Part → Boolean → Union them
+
+Try all patterns on test wall:
+  1. Create one 100×100 mm sketch
+  2. Change bondType and re-run 4 times
+  3. Compare results
+
+COORDINATION WITH YOUR SETUP
+----------------------------
+Skeleton.FCStd      - Store default brick parameters here
+Gordonsville.FCStd  - Your main station document
+Generate walls      - Use brick_generator_macro
+Add punchouts       - Create separately, cut from walls
+Archive            - Keep generated results in dated subdirectories
+
+NEXT PHASE (v3.1)
+-----------------
+Brick preset system (ho_standard, ho_large, etc.)
+Will let you use: bondType = "preset:ho_large" in spreadsheet
+
+VERSION HISTORY
+---------------
+v3.0.0 (2025-11-26) - Production ready, 4 patterns, tested
+v2.0.2 (2025-11-23) - All-in-one macro, 3 patterns
+v2.0.1 (earlier)    - Initial sketch-based version
+
+ARCHITECTURE
+------------
+brick_geometry.py      - Pure Python library (no FreeCAD needed)
+brick_generator_macro  - FreeCAD UI layer
+test_brick_geometry.py - 30 comprehensive tests (all passing)
+
+Files are independent: geometry library can be reused elsewhere
+
+SUPPORT
+-------
+1. Check console output for error messages
+2. Review DEPLOYMENT.md troubleshooting section
+3. Verify spreadsheet cell names are exact
+4. Try face workflow instead of sketch if sketch fails
+5. Run tests to confirm geometry library works
+
+KEY INSIGHT
+-----------
+This generator creates individual bricks that are FUSED together.
+The punchout method cuts openings AFTER fusing.
+This separates concerns and makes both operations simpler.
+
+================================================================================
+Ready to generate beautiful masonry! 🧱
+================================================================================
