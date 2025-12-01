@@ -1,180 +1,214 @@
-# Smart Trim Generator v1.1.0
+# Smart Trim Generator v1.2.0
 
-**Parametric Trim Generator for FreeCAD**
+Parametric trim generation for FreeCAD architectural models with automatic corner detection and miter angle calculation.
 
-Applies corner, eave, and gable trim to wall and roof faces decorated with clapboard or shingles.
+## What's New in v1.2.0
 
-## What's New in v1.1.0
+- **Advanced corner detection** - Automatically detects and classifies all corners
+- **Automatic miter angles** - Calculates proper miter cuts for any polygon shape
+- **Multiple corner types** - Handles external (convex), internal (concave), and straight corners
+- **Beveled profiles** - New beveled/chamfered trim profile option
+- **Better geometry** - Uses `trim_geometry.py` shared library
 
-**Major Improvement:** Full compatibility with new clapboard v5.3.0 and shingle v4.1.0!
+## Features
 
-- **Handles PropertyLink:** Works with new PropertyLink format (object references)
-- **Backward Compatible:** Still works with old PropertyString format (label strings)
-- **Auto-Detects:** Automatically detects which format is being used
-- **More Robust:** PropertyLink-based objects survive renames seamlessly
+- Apply trim to any planar face
+- Parametric control via spreadsheet
+- Multiple profile styles (rectangular, beveled)
+- Works with clapboard, shingle, or brick walls
+- Generates trim as separate compound (easy to edit)
 
 ## Installation
 
-### Quick Start (FreeCAD Only)
-
+### Quick Install (Recommended)
 ```bash
-tar -xzf smart-trim-generator-v1.1.0.tar.gz
-cd smart-trim-generator-v1.1.0
 python3 smart_trim_freecad_installer.py
 ```
 
-### Complete Integration (FreeCAD + Git Repository)
+### Manual Install
+1. Copy `smart_trim_generator.FCMacro` to your FreeCAD Macros folder
+2. Copy `trim_geometry.py` to the same directory
+3. Restart FreeCAD or reload macros
 
-```bash
-tar -xzf smart-trim-generator-v1.1.0.tar.gz
-cd smart-trim-generator-v1.1.0
-python3 smart_trim_freecad_installer.py
-python3 smart_trim_git_populate.py
+## Usage
+
+### Basic Workflow
+1. **Select faces** - Select one or more faces where you want trim
+2. **Run macro** - Execute `smart_trim_generator.FCMacro`
+3. **Adjust parameters** - Modify values in the `Trim_Params` spreadsheet
+4. **Recompute** - Press F5 or Document → Recompute
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| trim_width | 2.0 mm | How far trim extends from wall |
+| trim_height | 5.0 mm | Height of trim molding |
+| trim_style | rectangular | Profile style (rectangular/beveled) |
+| bevel_size | 0.5 mm | Bevel size for beveled profile |
+
+### Corner Detection
+
+The generator automatically:
+- Detects all corners in the face boundary
+- Classifies them as external (convex) or internal (concave)
+- Calculates exact interior angles
+- Computes proper miter cut angles
+
+Example output:
+```
+Processing face 1/1...
+  Detected 4 corners:
+    - 4 external (convex)
+    - 0 internal (concave)
+    Corner 1: external  90.0° (miter:  45.0°)
+    Corner 2: external  90.0° (miter:  45.0°)
+    Corner 3: external  90.0° (miter:  45.0°)
+    Corner 4: external  90.0° (miter:  45.0°)
+  ✓ Generated 4 trim segments
 ```
 
-## File Structure
+## Architecture
 
 ```
-smart-trim-generator-v1.1.0/
-├── smart_trim_generator.FCMacro ........ Main macro (v1.1.0)
-├── smart_trim_geometry.py ............. Pure Python geometry library
-├── smart_trim_freecad_installer.py ... FreeCAD installer script
-├── smart_trim_git_populate.py ......... Git repository organizer
-└── README.md .......................... This file
+smart-trim-generator-v1.2.0/
+├── smart_trim_generator.FCMacro  # Main macro
+├── trim_geometry.py              # Geometry library
+├── smart_trim_git_populate.py    # Git deployment
+├── smart_trim_freecad_installer.py  # FreeCAD installation
+├── test_trim_geometry.py         # Test suite
+└── README.md                     # This file
 ```
 
-## Usage in FreeCAD
+### Library: trim_geometry.py
 
-1. **Select a clapboard or shingle object** that has been generated
-2. **Run the macro:** Macro menu → Recent Macros → smart_trim_generator.FCMacro
-3. **Results:**
-   - `SmartTrim_*_Vertical` - Corner trim (vertical edges)
-   - `SmartTrim_*_Eave` - Eave trim (horizontal edges)
-   - `SmartTrim_*_Gable` - Gable trim (diagonal edges)
-   - All grouped in a Part::Compound for easy management
+Core geometry library providing:
+- `detect_corners(face)` - Find all corners in a face
+- `analyze_face_for_trim(face)` - Complete corner analysis
+- `create_simple_rectangular_profile(w, h)` - Rectangular profile
+- `create_beveled_profile(w, h, bevel)` - Beveled profile
+- `generate_trim_for_face(face, profile)` - Complete trim generation
 
-## Parameters
+Can be imported by other generators (clapboard, shingle, brick).
 
-Parameters are read from spreadsheet (default: "params" or "Spreadsheet"):
+## Examples
 
-- `trim_width`: Width of trim profile (mm) — default 2.0mm
-- `trim_thickness`: Thickness of trim material (mm) — default 1.0mm
-
-## Key Features
-
-✅ **Works with clapboard v5.3.0+** (PropertyLink enabled)
-✅ **Works with shingle v4.1.0+** (PropertyLink enabled)
-✅ **Backward compatible** with old objects (PropertyString)
-✅ **Handles mirrors** (Part::Mirroring and PartDesign::Mirrored)
-✅ **Detects holes** (windows/doors in wall faces)
-✅ **Edge classification** (vertical/horizontal/gable)
-✅ **Intelligent trim placement** (corner/eave/gable)
-
-## v1.1.0 Technical Details
-
-### What Changed
-
-In the `get_source_object_and_face()` function, added automatic detection of SourceObject format:
-
+### Simple Rectangle
 ```python
-if isinstance(source_object_value, str):
-    # OLD FORMAT: PropertyString (label lookup)
-else:
-    # NEW FORMAT: PropertyLink (direct reference)
+# 4 external 90° corners → 45° miters
+Face: 100mm × 50mm rectangle
+Result: 4 trim segments with perfect 45° corners
 ```
 
-### Why This Matters
+### L-Shaped Wall
+```python
+# 5 external + 1 internal corner
+Face: L-shaped
+Result: 6 trim segments
+  - 5 external 90° corners (45° miters)
+  - 1 internal 270° corner (135° miter)
+```
 
-**With PropertyLink (v5.3.0+):**
-- Trim automatically finds source wall/roof even after renames
-- More reliable object tracking
-- Cleaner FreeCAD architecture
+### Hexagonal Building
+```python
+# 6 external 120° corners → 60° miters
+Face: Regular hexagon
+Result: 6 trim segments with 60° miters
+```
 
-**With PropertyString (legacy):**
-- Still works exactly as before
-- No changes required to existing objects
-- Graceful fallback
+## Current Limitations
 
-### Automatic Detection
+### Not Yet Implemented
+- **Mitered corner pieces** - Currently generates straight segments only
+  - Corners will show gaps where miters should meet
+  - This is the top priority for v1.3.0
+- **Non-planar faces** - Only works on planar (flat) faces
+- **Curved edges** - Only supports straight edges
 
-No user configuration needed! The macro detects which format your objects use and handles accordingly.
+### Workarounds
+- For now, trim generates continuous segments
+- You can manually edit corner joints if needed
+- Future versions will include proper mitered corners
 
-## Testing
+## Technical Details
 
-After installation, try this workflow:
+### Corner Detection Algorithm
+Uses vector mathematics to determine corner types:
+```python
+turn_angle = vec_in.getAngle(vec_out)  # 0-180°
+cross = vec_in.cross(vec_out)          # Turn direction
 
-1. Generate a clapboard or shingle object
-2. Select it
-3. Run smart_trim_generator
-4. Verify trim appears correctly
-5. Rename the source wall/roof
-6. Verify trim object still finds the source (PropertyLink feature!)
+if cross.z > 0:  # External corner
+    interior_angle = 180° - turn_angle
+else:  # Internal corner
+    interior_angle = 180° + turn_angle
+```
 
-## Backward Compatibility
+This works for any polygon shape and correctly handles both convex and concave corners.
 
-✅ Works with clapboard v5.2.0 and earlier
-✅ Works with shingle v4.0.0 and earlier
-✅ Works with existing trim-decorated objects
-✅ No migration needed
+### Integration with Other Generators
+
+Other generators can import trim_geometry:
+```python
+import sys
+from pathlib import Path
+
+# Add smart_trim to path
+sys.path.insert(0, str(Path(__file__).parent.parent / 'smart_trim'))
+import trim_geometry as tg
+
+# Use it
+profile = tg.create_simple_rectangular_profile(2.0, 5.0)
+trim_pieces = tg.generate_trim_for_face(face, profile)
+```
 
 ## Version History
 
-```
-v1.1.0 (NOW)    ← PropertyLink support, backward compat with PropertyString
-  ↑
-v1.0.9          ← Works with old PropertyString only
-  ↑
-v1.0.0          ← Initial release
-```
+### v1.2.0 (2024-12-01)
+- Integrated `trim_geometry.py` library
+- Automatic corner detection and classification
+- Automatic miter angle calculation
+- Beveled profile option
+- Comprehensive corner analysis output
 
-## Troubleshooting
+### v1.1.0
+- Updated git populator with default path
+- Improved deployment scripts
 
-### "SourceObject property is None"
-The clapboard/shingle object exists but its SourceObject reference is unset. This shouldn't happen with normal generation but could occur with corrupted objects. Regenerate the clapboard/shingle.
+### v1.0.0
+- Initial release
+- Basic trim generation
+- Rectangular profiles
 
-### "Source object not found"
-For old PropertyString format: The source wall/roof was renamed after the clapboard was generated. Either rename it back or regenerate the clapboard.
+## Requirements
 
-For new PropertyLink format: Shouldn't happen (PropertyLink survives renames). If it does, check that the source object wasn't deleted.
-
-### Trim on wrong side
-Check the normal direction calculation. This is typically caused by unusual face orientation. Review the console output for "Outward direction" messages.
-
-### No trim generated
-Common causes:
-- Face has no edges (degenerate geometry)
-- All edges are at bottom of wall (bottom edges are skipped)
-- Face is covered by holes/windows (no perimeter edges)
-
-Check console output for edge classification details.
-
-## System Requirements
-
-- FreeCAD 0.20+ (tested with v1.0.x)
+- FreeCAD 0.21+ (tested with 1.0.1)
 - Python 3.8+
-- macOS, Linux, or Windows
+- Part workbench
+- Draft workbench (for utilities)
 
-## Integration with Clapboard & Shingle
+## Files
 
-Smart trim is designed to work seamlessly with:
-- **Clapboard Generator v5.3.0+** (recommended) or v5.2.0 and earlier
-- **Shingle Generator v4.1.0+** (recommended) or v4.0.0 and earlier
+1. `smart_trim_generator.FCMacro` - Main macro (6.5 KB)
+2. `trim_geometry.py` - Geometry library (13 KB)
+3. `smart_trim_git_populate.py` - Git deployment script
+4. `smart_trim_freecad_installer.py` - FreeCAD installer
+5. `test_trim_geometry.py` - Test suite
+6. `README.md` - This documentation
 
-Typical workflow:
-1. Generate walls with clapboards
-2. Generate roofs with shingles
-3. Apply smart trim to both
-4. Final result: professional-looking detailed buildings
+## Support
 
-## Performance
+For issues or questions:
+1. Check the integration guide: `TRIM_INTEGRATION_GUIDE.md`
+2. Review test cases in `test_trim_geometry.py`
+3. See example usage in `trim_generation_demo.FCMacro`
 
-Typical operation for a wall face:
-- 10-50 edges: ~5 seconds
-- 50-100 edges: ~10 seconds
-- Fusing trim parts: ~2 seconds per 10 parts
+## License
 
----
+MIT License - Free to use and modify
 
-**Production-ready trim generator. Works with modern and legacy generators.** ✅
+## Author
 
-Ready to deploy alongside clapboard v5.3.0 and shingle v4.1.0!
+Brian White  
+COVA Model Railroad Project  
+Version 1.2.0 - December 2024
