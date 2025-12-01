@@ -1,11 +1,13 @@
 """
-Parametric Shingle Generator for FreeCAD v4.0.0
+Parametric Shingle Generator for FreeCAD v4.1.0
 Generates realistic shingles on roof surfaces from selected faces
 
 Author: Brian (with Claude assistance)
 Usage: Select one or more roof faces, run as macro in FreeCAD
 
 Version History:
+- 4.1.0: CHANGE: SourceObject now uses App::PropertyLink (TNP-safe object reference)
+         CHANGE: Stores actual object reference instead of label string
 - 4.0.0: MAJOR REFACTOR - Extract geometry to shingle_geometry.py
          Face-based selection (match clapboard v5.2.0 pattern)
          Add comprehensive parameter and face validation
@@ -50,7 +52,7 @@ except ImportError as e:
     print("Make sure shingle_geometry.py is in the _lib subdirectory of your Macro folder")
     sys.exit(1)
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 GENERATOR_NAME = "shingle_generator"
 
 
@@ -182,13 +184,13 @@ def scale_vector(vec, scale):
     return App.Vector(vec.x * scale, vec.y * scale, vec.z * scale)
 
 
-def generate_shingles(face, object_name, params):
+def generate_shingles(face, source_obj, params):
     """
     Generate shingles on a face.
     
     Args:
         face: The face to cover with shingles
-        object_name: Name of the source object (for metadata)
+        source_obj: The source FreeCAD object (for reference)
         params: Dictionary with parameters:
             - shingleWidth: Width of each shingle (mm)
             - shingleHeight: Height of each shingle (mm)
@@ -202,6 +204,7 @@ def generate_shingles(face, object_name, params):
     """
     
     doc = App.ActiveDocument
+    object_name = source_obj.Label
     
     # Extract parameters
     shingle_width = params.get('shingleWidth', 10.0)
@@ -387,7 +390,7 @@ def generate_shingles(face, object_name, params):
     print("✓ Shingles clipped to face boundaries during generation\n")
     
     # Create result object
-    result_name = f"ShingledRoof_{object_name}"
+    result_name = f"ShingledRoof_{source_obj.Label}"
     result_obj = doc.addObject("Part::Feature", result_name)
     result_obj.Shape = trimmed_compound
     
@@ -398,8 +401,8 @@ def generate_shingles(face, object_name, params):
     result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
     result_obj.GeneratorVersion = VERSION
     
-    result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
-    result_obj.SourceObject = object_name
+    result_obj.addProperty("App::PropertyLink", "SourceObject", "Metadata", "Source object reference")
+    result_obj.SourceObject = source_obj
     
     doc.recompute()
     
@@ -504,7 +507,7 @@ if __name__ == "__main__":
                     fail_count = 0
                     
                     for sel in selection:
-                        obj_name = sel.Object.Label
+                        source_obj = sel.Object
                         
                         for sub_element in sel.SubElementNames:
                             if not sub_element.startswith("Face"):
@@ -514,16 +517,16 @@ if __name__ == "__main__":
                             try:
                                 # Get the actual face object
                                 face_index = int(sub_element[4:]) - 1  # Face6 -> index 5
-                                face = sel.Object.Shape.Faces[face_index]
+                                face = source_obj.Shape.Faces[face_index]
                                 
                                 print(f"\n{'='*60}")
-                                print(f"Processing: {obj_name} / {sub_element}")
+                                print(f"Processing: {source_obj.Label} / {sub_element}")
                                 print(f"{'='*60}")
                                 
                                 # Generate shingles for this face
-                                result = generate_shingles(face, obj_name, params)
+                                result = generate_shingles(face, source_obj, params)
                                 
-                                print(f"\n✓ SUCCESS: Generated shingles for {obj_name}/{sub_element}\n")
+                                print(f"\n✓ SUCCESS: Generated shingles for {source_obj.Label}/{sub_element}\n")
                                 success_count += 1
                                 
                             except Exception as e:
