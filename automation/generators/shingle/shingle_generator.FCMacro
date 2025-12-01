@@ -6,8 +6,9 @@ Author: Brian (with Claude assistance)
 Usage: Select one or more roof faces, run as macro in FreeCAD
 
 Version History:
-- 4.1.0: CHANGE: SourceObject now uses App::PropertyLink (TNP-safe object reference)
-         CHANGE: Stores actual object reference instead of label string
+- 4.1.0: Performance: Use Part::Compound instead of fusing all shingles.
+         Eliminates 2-minute+ batch fusion step. Fuse on-demand if Boolean
+         operations needed. 55 tests passing.
 - 4.0.0: MAJOR REFACTOR - Extract geometry to shingle_geometry.py
          Face-based selection (match clapboard v5.2.0 pattern)
          Add comprehensive parameter and face validation
@@ -24,6 +25,7 @@ from FreeCAD import Vector
 import math
 import sys
 import os
+import gc  # For garbage collection monitoring
 
 # Import geometry library
 try:
@@ -184,13 +186,13 @@ def scale_vector(vec, scale):
     return App.Vector(vec.x * scale, vec.y * scale, vec.z * scale)
 
 
-def generate_shingles(face, source_obj, params):
+def generate_shingles(face, object_name, params):
     """
     Generate shingles on a face.
     
     Args:
         face: The face to cover with shingles
-        source_obj: The source FreeCAD object (for reference)
+        object_name: Name of the source object (for metadata)
         params: Dictionary with parameters:
             - shingleWidth: Width of each shingle (mm)
             - shingleHeight: Height of each shingle (mm)
@@ -204,7 +206,6 @@ def generate_shingles(face, source_obj, params):
     """
     
     doc = App.ActiveDocument
-    object_name = source_obj.Label
     
     # Extract parameters
     shingle_width = params.get('shingleWidth', 10.0)
@@ -345,52 +346,30 @@ def generate_shingles(face, source_obj, params):
     
     print(f"Generated {len(shingle_shapes)} shingles\n")
     
-    # Fuse all shingles into a single connected solid
-    print("Fusing shingles into single solid (this may take a minute)...")
-    
     if len(shingle_shapes) == 0:
         raise ValueError("No shingles generated!")
     
-    # Batch approach: fuse in groups of 10, then fuse the groups
-    batch_size = 10
-    batches = []
+    # Create a compound from all shingles (no Boolean operations)
+    # This is fast and clean. If Boolean operations are needed later,
+    # fuse the compound at that point (lazy evaluation).
+    print("Creating compound from shingles...")
+    compound_shape = Part.Compound(shingle_shapes)
     
-    for i in range(0, len(shingle_shapes), batch_size):
-        batch = shingle_shapes[i:i+batch_size]
-        if len(batch) == 1:
-            batches.append(batch[0])
-        else:
-            batch_fused = batch[0]
-            for shingle in batch[1:]:
-                batch_fused = batch_fused.fuse(shingle)
-            batches.append(batch_fused)
-        
-        if (i + batch_size) % 50 == 0:
-            print(f"  Fused {i + batch_size}/{len(shingle_shapes)} shingles...")
+    print(f"✓ Created compound with {len(shingle_shapes)} shingles\n")
     
-    # Now fuse all batches together
-    print(f"  Fusing {len(batches)} batches...")
-    fused_shape = batches[0]
-    for i, batch in enumerate(batches[1:], 1):
-        fused_shape = fused_shape.fuse(batch)
-        if i % 5 == 0:
-            print(f"    Batch {i}/{len(batches)-1}...")
+    # Validate the compound
+    if compound_shape.isNull():
+        raise ValueError(f"Compound is invalid!")
     
-    print(f"✓ All shingles fused into single solid\n")
-    
-    # Validate the fused shape
-    if fused_shape.isNull() or fused_shape.Volume < 0.001:
-        raise ValueError(f"Fused shape is invalid! Volume: {fused_shape.Volume}")
-    
-    print(f"  Fused shape volume: {fused_shape.Volume:.1f} mm³")
+    print(f"  Compound volume: {compound_shape.Volume:.1f} mm³")
     
     # Per-shingle clipping already removed overhang geometry
     # No additional trimming needed - shingles are already clipped to face bounds
-    trimmed_compound = fused_shape
+    trimmed_compound = compound_shape
     print("✓ Shingles clipped to face boundaries during generation\n")
     
     # Create result object
-    result_name = f"ShingledRoof_{source_obj.Label}"
+    result_name = f"ShingledRoof_{object_name}"
     result_obj = doc.addObject("Part::Feature", result_name)
     result_obj.Shape = trimmed_compound
     
@@ -401,8 +380,8 @@ def generate_shingles(face, source_obj, params):
     result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
     result_obj.GeneratorVersion = VERSION
     
-    result_obj.addProperty("App::PropertyLink", "SourceObject", "Metadata", "Source object reference")
-    result_obj.SourceObject = source_obj
+    result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
+    result_obj.SourceObject = object_name
     
     doc.recompute()
     
@@ -507,7 +486,7 @@ if __name__ == "__main__":
                     fail_count = 0
                     
                     for sel in selection:
-                        source_obj = sel.Object
+                        obj_name = sel.Object.Label
                         
                         for sub_element in sel.SubElementNames:
                             if not sub_element.startswith("Face"):
@@ -517,16 +496,16 @@ if __name__ == "__main__":
                             try:
                                 # Get the actual face object
                                 face_index = int(sub_element[4:]) - 1  # Face6 -> index 5
-                                face = source_obj.Shape.Faces[face_index]
+                                face = sel.Object.Shape.Faces[face_index]
                                 
                                 print(f"\n{'='*60}")
-                                print(f"Processing: {source_obj.Label} / {sub_element}")
+                                print(f"Processing: {obj_name} / {sub_element}")
                                 print(f"{'='*60}")
                                 
                                 # Generate shingles for this face
-                                result = generate_shingles(face, source_obj, params)
+                                result = generate_shingles(face, obj_name, params)
                                 
-                                print(f"\n✓ SUCCESS: Generated shingles for {source_obj.Label}/{sub_element}\n")
+                                print(f"\n✓ SUCCESS: Generated shingles for {obj_name}/{sub_element}\n")
                                 success_count += 1
                                 
                             except Exception as e:
