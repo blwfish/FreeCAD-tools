@@ -1,731 +1,341 @@
 """
-Smart Trim Generator for FreeCAD v1.1.0
+Smart Trim Generator for FreeCAD v1.2.0
 
-Applies parametric trim (corner boards, eave trim, gable trim) to wall faces
-that have been decorated with clapboard or shingles.
+Applies parametric trim (corner boards, eave trim, gable trim) to wall faces.
+Now includes advanced corner detection and automatic miter angle calculation.
 
-Author: Generated for model railroading (HO/O/N scale)
-Usage: Select a clapboard or shingle object, then run this macro
+WORKFLOW:
+1. Select one or more faces where you want trim
+2. Run this macro
+3. Adjust parameters in the Trim object's spreadsheet
+4. Recompute to update trim geometry
 
-Version History:
-- 1.1.0: IMPROVEMENT: Handle PropertyLink for SourceObject (clapboard v5.3.0+, shingle v4.1.0+)
-         BACKWARD COMPAT: Still supports old PropertyString format (auto-detected)
-         If SourceObject is PropertyLink: direct object reference (more robust)
-         If SourceObject is PropertyString: label lookup (legacy objects)
-- 1.0.9: Fixed outward direction for source clapboards
-         - Clapboard geometry extends on BOTH sides of face (mostly into wall)
-         - Now checks which direction clapboard extends BEYOND the face
-         - The side that protrudes past the face is the outward direction
-- 1.0.8: Fixed outward direction detection for all cases
-- 1.0.7: Rewrote outward direction detection
-- 1.0.6: Fixed mirror normal direction
-- 1.0.5: Fixed two critical issues
-- 1.0.3: Fixed edge detection to analyze source wall face
-- 1.0.2: Added punchout hole detection
-- 1.0.1: Fixed mirror support
-- 1.0.0: Initial release
+NEW IN v1.2.0:
+- Integrated trim_geometry library for corner detection
+- Automatic miter angle calculation for any polygon
+- Support for both external and internal corners
+- Beveled profile option
+
+Author: Brian White
+Version: 1.2.0
+License: MIT
 """
 
 import FreeCAD as App
+import FreeCADGui as Gui
 import Part
-from FreeCAD import Vector
-import math
+import Draft
 import sys
+from pathlib import Path
 
-VERSION = "1.1.0"
-GENERATOR_NAME = "smart_trim_generator"
+# Get the directory where this macro is located
+MACRO_DIR = Path(__file__).parent
+sys.path.insert(0, str(MACRO_DIR))
 
-# Import the geometry library
 try:
-    import sys
-    from pathlib import Path
-    
-    # FreeCAD user macro directory
-    macro_base = Path.home() / "Library" / "Application Support" / "FreeCAD" / "Macro"
-    lib_dir = macro_base / "_lib"
-    
-    # Remove any old instances from sys.modules to force fresh import
-    if 'smart_trim_geometry' in sys.modules:
-        del sys.modules['smart_trim_geometry']
-    
-    # Add to path if not already there
-    lib_dir_str = str(lib_dir)
-    if lib_dir_str not in sys.path:
-        sys.path.insert(0, lib_dir_str)
-    
-    print(f"Loading from: {lib_dir_str}")
-    
-    from smart_trim_geometry import (
-        classify_edges,
-        get_edge_length,
-        validate_trim_parameters,
+    import trim_geometry as tg
+except ImportError:
+    App.Console.PrintError(
+        "ERROR: Cannot find trim_geometry.py\n"
+        "Make sure trim_geometry.py is in the same directory as this macro.\n"
     )
-    print(f"✓ Loaded smart_trim_geometry library")
-except ImportError as e:
-    App.Console.PrintError(f"ERROR: Could not import smart_trim_geometry: {e}\n")
-    App.Console.PrintError(f"Expected location: {lib_dir}/smart_trim_geometry.py\n")
-    sys.exit(1)
+    raise
+
+# ==============================================================================
+# DEFAULT PARAMETERS
+# ==============================================================================
+
+DEFAULT_PARAMS = {
+    'trim_width': 2.0,      # mm - how far trim extends from wall
+    'trim_height': 5.0,     # mm - height of trim molding
+    'trim_style': 'rectangular',  # 'rectangular' or 'beveled'
+    'bevel_size': 0.5,      # mm - bevel size for beveled profile
+    'version': '1.2.0',
+}
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+
+def create_parameter_spreadsheet(obj, params):
+    """Create a spreadsheet with trim parameters."""
+    ss = obj.Document.addObject('Spreadsheet::Sheet', f'{obj.Name}_Params')
+    
+    # Add parameters
+    ss.set('A1', 'Parameter')
+    ss.set('B1', 'Value')
+    ss.set('C1', 'Description')
+    
+    row = 2
+    for key, value in params.items():
+        ss.set(f'A{row}', key)
+        ss.set(f'B{row}', str(value))
+        row += 1
+    
+    # Add descriptions
+    ss.set('C2', 'mm - trim width perpendicular to wall')
+    ss.set('C3', 'mm - trim height parallel to wall')
+    ss.set('C4', 'rectangular or beveled')
+    ss.set('C5', 'mm - bevel size (if beveled)')
+    ss.set('C6', 'Generator version')
+    
+    # Make cells read-only except values
+    ss.setStyle('A1:C1', 'bold', 'add')
+    
+    ss.recompute()
+    return ss
 
 
-def find_spreadsheet(doc, preferred_names):
-    """Find spreadsheet by checking both object name and label."""
-    for ss_name in preferred_names:
-        obj = doc.getObject(ss_name)
-        if obj and obj.TypeId == 'Spreadsheet::Sheet':
-            print(f"Found spreadsheet by name: '{ss_name}'")
-            return obj
-        
-        for obj in doc.Objects:
-            if obj.TypeId == 'Spreadsheet::Sheet' and obj.Label == ss_name:
-                print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
-                return obj
-    
-    return None
-
-
-def get_params_from_spreadsheet(doc):
-    """Try to read trim parameters from spreadsheet."""
-    preferred_names = ["params", "TrimParameters", "BuildingParameters", "Spreadsheet"]
-    
-    ss = find_spreadsheet(doc, preferred_names)
-    if ss is None:
-        return None
-    
-    params = {}
-    param_map = {
-        'trim_width': ['trim_width', 'TrimWidth', 'trimWidth'],
-        'trim_thickness': ['trim_thickness', 'TrimThickness', 'thickness'],
-    }
-    
-    for param_key, possible_names in param_map.items():
-        for name in possible_names:
+def get_param_value(ss, param_name):
+    """Get a parameter value from spreadsheet."""
+    for row in range(2, 20):
+        cell_name = ss.get(f'A{row}')
+        if cell_name == param_name:
+            value = ss.get(f'B{row}')
+            # Try to convert to appropriate type
             try:
-                val = ss.get(name)
-                if val is not None:
-                    params[param_key] = float(val)
-                    break
-            except:
-                continue
-    
-    return params if params else None
-
-
-def parse_clapboard_name(obj_name):
-    """Parse clapboard object name to extract source object and face index."""
-    if obj_name.startswith("ClapboardWall_"):
-        parts = obj_name.split("_F")
-        if len(parts) == 2:
-            try:
-                face_index = int(parts[1])
-                source_name = parts[0].replace("ClapboardWall_", "")
-                return (source_name, face_index)
+                if '.' in value:
+                    return float(value)
+                return int(value)
             except ValueError:
-                return None
-    
-    if obj_name.startswith("ShingledRoof_"):
-        source_name = obj_name.replace("ShingledRoof_", "")
-        return (source_name, None)
-    
+                return value
     return None
 
 
-def get_source_object_and_face(doc, trim_source_obj):
-    """
-    Derive the source wall object and face from a clapboard/shingle object.
+def create_trim_profile(params):
+    """Create trim profile based on parameters."""
+    width = params['trim_width']
+    height = params['trim_height']
+    style = params['trim_style']
     
-    v1.1.0 IMPROVEMENT: Now handles both PropertyLink (v5.3.0+) and PropertyString (legacy)
+    if style == 'beveled':
+        bevel = params['bevel_size']
+        return tg.create_beveled_profile(width, height, bevel)
+    else:
+        return tg.create_simple_rectangular_profile(width, height)
+
+
+# ==============================================================================
+# MAIN GENERATION FUNCTION
+# ==============================================================================
+
+def generate_trim(selected_faces, params):
+    """
+    Generate trim for selected faces.
     
     Args:
-        doc: FreeCAD document
-        trim_source_obj: The clapboard or shingle object selected by user (may be a mirror)
-    
+        selected_faces: List of Face objects
+        params: Dictionary of parameters
+        
     Returns:
-        Tuple of (source_object, face_index, clapboard_obj) or raises ValueError
+        Compound of all trim pieces
     """
-    # Handle Part::Mirroring objects
-    print(f"DEBUG: trim_source_obj.TypeId = '{trim_source_obj.TypeId}'")
-    print(f"DEBUG: TypeId == 'Part::Mirroring' = {trim_source_obj.TypeId == 'Part::Mirroring'}")
-    print(f"DEBUG: hasattr Source = {hasattr(trim_source_obj, 'Source')}")
+    print(f"\n{'='*72}")
+    print("SMART TRIM GENERATOR v1.2.0")
+    print(f"{'='*72}\n")
     
-    if trim_source_obj.TypeId == 'Part::Mirroring' and hasattr(trim_source_obj, 'Source'):
-        print(f"DEBUG: Detected Part::Mirroring, reading from Source object")
-        clapboard_obj = trim_source_obj.Source
-        print(f"DEBUG: clapboard_obj.Name = '{clapboard_obj.Name}'")
-    else:
-        print(f"DEBUG: NOT detected as Part::Mirroring, using trim_source_obj directly")
-        clapboard_obj = trim_source_obj
-        print(f"DEBUG: clapboard_obj.Name = '{clapboard_obj.Name}'")
+    all_trim_pieces = []
     
-    print(f"DEBUG: About to check for SourceObject property on '{clapboard_obj.Name}'")
+    # Create profile once
+    profile = create_trim_profile(params)
+    print(f"Trim profile: {params['trim_style']} "
+          f"({params['trim_width']}mm × {params['trim_height']}mm)")
     
-    # v1.1.0: Handle both PropertyLink (new) and PropertyString (legacy)
-    if hasattr(clapboard_obj, 'SourceObject'):
-        source_object_value = clapboard_obj.SourceObject
+    # Process each selected face
+    for i, face in enumerate(selected_faces, 1):
+        print(f"\nProcessing face {i}/{len(selected_faces)}...")
         
-        # Detect property type: PropertyLink or PropertyString
-        # PropertyLink: value is an object reference (FreeCAD object)
-        # PropertyString: value is a string (label)
+        # Check face orientation - if corners are all internal, face might be reversed
+        analysis = tg.analyze_face_for_trim(face)
         
-        if isinstance(source_object_value, str):
-            # OLD FORMAT: PropertyString - value is a label string
-            source_label = source_object_value
-            print(f"Found SourceObject property (PropertyString): {source_label}")
-            
-            # Look up by label
-            source_obj = None
-            for obj in doc.Objects:
-                if obj.Label == source_label:
-                    source_obj = obj
-                    break
-            
-            if source_obj is None:
-                raise ValueError(
-                    f"Source object '{source_label}' (from property) not found in document"
-                )
-        else:
-            # NEW FORMAT: PropertyLink - value is already an object reference
-            # This is the recommended format (clapboard v5.3.0+, shingle v4.1.0+)
-            source_obj = source_object_value
-            print(f"Found SourceObject property (PropertyLink): {source_obj.Label if source_obj else 'None'}")
-            
-            if source_obj is None:
-                raise ValueError(
-                    f"SourceObject property is None (property exists but is unset)"
-                )
-    else:
-        # Fallback: try to parse from object name
-        parse_result = parse_clapboard_name(clapboard_obj.Name)
+        # If all corners are internal (270°), face is probably reversed
+        if analysis['num_internal'] == analysis['num_corners'] and analysis['num_corners'] > 0:
+            # Check if they're all ~270° (reversed face indicator)
+            avg_angle = sum(c.angle for c in analysis['all_corners']) / len(analysis['all_corners'])
+            if 260 < avg_angle < 280:
+                print(f"  ⚠ Face appears reversed (all internal 270°), reversing...")
+                face = face.reversed()
+                # Re-analyze with corrected face
+                analysis = tg.analyze_face_for_trim(face)
         
-        if parse_result is None:
-            raise ValueError(
-                f"Could not parse source object from '{clapboard_obj.Name}'\n"
-                f"Expected format: ClapboardWall_<SourceObject>_F<FaceIndex>\n"
-                f"(or object should have SourceObject property)"
-            )
+        print(f"  Detected {analysis['num_corners']} corners:")
+        print(f"    - {analysis['num_external']} external (convex)")
+        print(f"    - {analysis['num_internal']} internal (concave)")
         
-        source_name, face_index = parse_result
+        # Show corner details
+        for j, corner in enumerate(analysis['all_corners'], 1):
+            print(f"    Corner {j}: {corner.corner_type.value:8s} "
+                  f"{corner.angle:6.1f}° (miter: {corner.miter_angle():5.1f}°)")
         
-        # Look up source object in document
-        source_obj = doc.getObject(source_name)
-        if source_obj is None:
-            raise ValueError(
-                f"Source object '{source_name}' not found in document\n"
-                f"(derived from '{clapboard_obj.Name}')"
-            )
-    
-    if not hasattr(source_obj, 'Shape'):
-        raise ValueError(
-            f"Source object '{source_obj.Label}' has no Shape property"
-        )
-    
-    # Get face index from FaceIndex property
-    if hasattr(clapboard_obj, 'FaceIndex'):
-        face_index = clapboard_obj.FaceIndex
-        print(f"Found FaceIndex property: {face_index}")
-    else:
-        # Fallback: try to parse from name
-        parse_result = parse_clapboard_name(clapboard_obj.Name)
-        if parse_result is None or parse_result[1] is None:
-            raise ValueError(
-                f"Could not extract face index from '{clapboard_obj.Name}'\n"
-                f"(or object should have FaceIndex property)"
-            )
-        face_index = parse_result[1]
-    
-    if face_index >= len(source_obj.Shape.Faces):
-        raise ValueError(
-            f"Face index {face_index} out of range for '{source_obj.Label}'\n"
-            f"(object has {len(source_obj.Shape.Faces)} faces)"
-        )
-    
-    return source_obj, face_index, clapboard_obj
-
-
-def get_face_edges(face):
-    """Extract edges from a face's outer wire."""
-    wires = face.Wires
-    if not wires:
-        raise ValueError("Face has no wires!")
-    
-    outer_wire = max(wires, key=lambda w: abs(Part.Face(w).Area))
-    
-    edges = []
-    for edge in outer_wire.Edges:
-        start = edge.valueAt(edge.FirstParameter)
-        end = edge.valueAt(edge.LastParameter)
-        
-        edges.append({
-            'start': (start.x, start.y, start.z),
-            'end': (end.x, end.y, end.z),
-            'edge_obj': edge,
-            'length': edge.Length,
-        })
-    
-    return edges
-
-
-def point_on_bbox_boundary(point, bbox, tolerance=0.01):
-    """Check if a point is on the boundary of a bounding box."""
-    x, y, z = point
-    
-    on_xmin = abs(x - bbox.XMin) < tolerance
-    on_xmax = abs(x - bbox.XMax) < tolerance
-    on_ymin = abs(y - bbox.YMin) < tolerance
-    on_ymax = abs(y - bbox.YMax) < tolerance
-    on_zmin = abs(z - bbox.ZMin) < tolerance
-    on_zmax = abs(z - bbox.ZMax) < tolerance
-    
-    return on_xmin or on_xmax or on_ymin or on_ymax or on_zmin or on_zmax
-
-
-def detect_punchout_misalignment(edges, bbox, tolerance=0.01):
-    """Detect if any edges indicate a punchout misalignment."""
-    problem_edges = []
-    
-    for i, edge in enumerate(edges):
-        start_on_boundary = point_on_bbox_boundary(edge['start'], bbox, tolerance)
-        end_on_boundary = point_on_bbox_boundary(edge['end'], bbox, tolerance)
-        
-        if start_on_boundary != end_on_boundary:
-            problem_edges.append(i)
-    
-    return len(problem_edges) > 0, problem_edges
-
-
-def classify_edge_location(edge, bbox, tolerance=0.01):
-    """Classify an edge as 'boundary' or 'interior'."""
-    start_on_boundary = point_on_bbox_boundary(edge['start'], bbox, tolerance)
-    end_on_boundary = point_on_bbox_boundary(edge['end'], bbox, tolerance)
-    
-    if start_on_boundary and end_on_boundary:
-        return 'boundary'
-    else:
-        return 'interior'
-
-
-def is_perimeter_edge(edge_obj, bbox, normal_axis, tolerance=0.1):
-    """Check if an edge lies on the outer perimeter of the face bounding box."""
-    start = edge_obj.valueAt(edge_obj.FirstParameter)
-    end = edge_obj.valueAt(edge_obj.LastParameter)
-    
-    if normal_axis == 'x':
-        at_ymin = abs(start.y - bbox.YMin) < tolerance and abs(end.y - bbox.YMin) < tolerance
-        at_ymax = abs(start.y - bbox.YMax) < tolerance and abs(end.y - bbox.YMax) < tolerance
-        at_zmin = abs(start.z - bbox.ZMin) < tolerance and abs(end.z - bbox.ZMin) < tolerance
-        at_zmax = abs(start.z - bbox.ZMax) < tolerance and abs(end.z - bbox.ZMax) < tolerance
-        return at_ymin or at_ymax or at_zmin or at_zmax
-    
-    elif normal_axis == 'y':
-        at_xmin = abs(start.x - bbox.XMin) < tolerance and abs(end.x - bbox.XMin) < tolerance
-        at_xmax = abs(start.x - bbox.XMax) < tolerance and abs(end.x - bbox.XMax) < tolerance
-        at_zmin = abs(start.z - bbox.ZMin) < tolerance and abs(end.z - bbox.ZMin) < tolerance
-        at_zmax = abs(start.z - bbox.ZMax) < tolerance and abs(end.z - bbox.ZMax) < tolerance
-        return at_xmin or at_xmax or at_zmin or at_zmax
-    
-    else:  # normal_axis == 'z'
-        at_xmin = abs(start.x - bbox.XMin) < tolerance and abs(end.x - bbox.XMin) < tolerance
-        at_xmax = abs(start.x - bbox.XMax) < tolerance and abs(end.x - bbox.XMax) < tolerance
-        at_ymin = abs(start.y - bbox.YMin) < tolerance and abs(end.y - bbox.YMin) < tolerance
-        at_ymax = abs(start.y - bbox.YMax) < tolerance and abs(end.y - bbox.YMax) < tolerance
-        return at_xmin or at_xmax or at_ymin or at_ymax
-
-
-def detect_face_orientation(bbox):
-    """Detect which plane a face lies in based on bounding box extents."""
-    x_extent = bbox.XMax - bbox.XMin
-    y_extent = bbox.YMax - bbox.YMin
-    z_extent = bbox.ZMax - bbox.ZMin
-    
-    tolerance = 0.1
-    
-    if x_extent < tolerance:
-        return 'z', 'y', 'x'
-    elif y_extent < tolerance:
-        return 'z', 'x', 'y'
-    elif z_extent < tolerance:
-        return 'y', 'x', 'z'
-    else:
-        if z_extent >= y_extent and z_extent >= x_extent:
-            if x_extent > y_extent:
-                return 'z', 'x', 'y'
-            else:
-                return 'z', 'y', 'x'
-        else:
-            return 'y', 'x', 'z'
-
-
-def create_trim_along_edge(edge, vertical_axis, normal_direction, 
-                           trim_width, trim_thickness):
-    """Create trim geometry along a single edge."""
-    start = edge.valueAt(edge.FirstParameter)
-    end = edge.valueAt(edge.LastParameter)
-    edge_length = edge.Length
-    
-    if edge_length < 0.001:
-        return None
-    
-    edge_dir = (end - start)
-    edge_dir.normalize()
-    
-    width_dir = edge_dir.cross(normal_direction)
-    width_dir.normalize()
-    
-    v1 = start
-    v2 = start + (normal_direction * trim_thickness)
-    v5 = v1 - (width_dir * trim_width)
-    v6 = v2 - (width_dir * trim_width)
-    
-    v4 = end
-    v3 = end + (normal_direction * trim_thickness)
-    v8 = v4 - (width_dir * trim_width)
-    v7 = v3 - (width_dir * trim_width)
-    
-    try:
-        back_face = Part.Face(Part.makePolygon([v1, v4, v8, v5, v1]))
-        front_face = Part.Face(Part.makePolygon([v2, v3, v7, v6, v2]))
-        bottom_face = Part.Face(Part.makePolygon([v1, v2, v3, v4, v1]))
-        top_face = Part.Face(Part.makePolygon([v5, v6, v7, v8, v5]))
-        start_face = Part.Face(Part.makePolygon([v1, v5, v6, v2, v1]))
-        end_face = Part.Face(Part.makePolygon([v4, v3, v7, v8, v4]))
-        
-        shell = Part.Shell([back_face, front_face, bottom_face, top_face, start_face, end_face])
-        trim_solid = Part.Solid(shell)
-        
-        return trim_solid
-    except Exception as e:
-        print(f"    Warning: Could not create trim solid: {e}")
+        # Generate trim for this face
         try:
-            front_wire = Part.makePolygon([v2, v3, v7, v6, v2])
-            front_face = Part.Face(front_wire)
-            return front_face
-        except:
-            return None
-
-
-def generate_trim(clapboard_obj, face_index, trim_width=2.0, trim_thickness=1.0, 
-                  selected_obj=None):
-    """Generate corner, eave, and gable trim for a clapboard face."""
-    is_mirror = (selected_obj is not None and selected_obj.TypeId == 'Part::Mirroring')
-    print(f"\nGenerating smart trim for face {face_index}...")
-    
-    if not hasattr(clapboard_obj, 'SourceObject'):
-        raise ValueError(f"Clapboard object missing SourceObject property")
-    
-    import FreeCAD as App
-    doc = App.ActiveDocument
-    
-    # v1.1.0: Handle both PropertyLink and PropertyString
-    source_object_value = clapboard_obj.SourceObject
-    if isinstance(source_object_value, str):
-        source_wall_label = source_object_value
-        source_wall = None
-        for obj in doc.Objects:
-            if obj.Label == source_wall_label:
-                source_wall = obj
-                break
-        if source_wall is None:
-            raise ValueError(f"Source wall '{source_wall_label}' not found")
-    else:
-        source_wall = source_object_value
-        if source_wall is None:
-            raise ValueError(f"SourceObject property is None")
-    
-    if face_index >= len(source_wall.Shape.Faces):
-        raise ValueError(f"Face index {face_index} out of range for source wall")
-    
-    face = source_wall.Shape.Faces[face_index]
-    print(f"Analyzing source wall face: {source_wall.Label}, face {face_index}")
-    print(f"  Face area: {face.Area:.2f} mm², wires: {len(face.Wires)}")
-    
-    bbox = face.BoundBox
-    vertical_axis, horizontal_axis, normal_axis = detect_face_orientation(bbox)
-    
-    print(f"Face orientation: vertical={vertical_axis}, horizontal={horizontal_axis}")
-    
-    from FreeCAD import Vector
-    
-    face_bbox = face.BoundBox
-    source_clapboard_bbox = clapboard_obj.Shape.BoundBox
-    
-    if normal_axis == 'x':
-        face_x = (face_bbox.XMin + face_bbox.XMax) / 2
-        extend_positive = source_clapboard_bbox.XMax - face_x
-        extend_negative = face_x - source_clapboard_bbox.XMin
-        if extend_positive > 0.01:
-            outward_sign = 1.0
-        elif extend_negative > 0.01:
-            outward_sign = -1.0
-        else:
-            outward_sign = 1.0 if extend_positive > extend_negative else -1.0
-        face_normal = Vector(outward_sign, 0, 0)
-        print(f"Source face at X={face_x:.2f}, clapboard X range: {source_clapboard_bbox.XMin:.2f} to {source_clapboard_bbox.XMax:.2f}")
-        print(f"Extends beyond face: +X by {extend_positive:.2f}, -X by {extend_negative:.2f}")
-        print(f"Outward direction: {'positive' if outward_sign > 0 else 'negative'} X")
-        
-    elif normal_axis == 'y':
-        face_y = (face_bbox.YMin + face_bbox.YMax) / 2
-        extend_positive = source_clapboard_bbox.YMax - face_y
-        extend_negative = face_y - source_clapboard_bbox.YMin
-        if extend_positive > 0.01:
-            outward_sign = 1.0
-        elif extend_negative > 0.01:
-            outward_sign = -1.0
-        else:
-            outward_sign = 1.0 if extend_positive > extend_negative else -1.0
-        face_normal = Vector(0, outward_sign, 0)
-        print(f"Source face at Y={face_y:.2f}, clapboard Y range: {source_clapboard_bbox.YMin:.2f} to {source_clapboard_bbox.YMax:.2f}")
-        print(f"Extends beyond face: +Y by {extend_positive:.2f}, -Y by {extend_negative:.2f}")
-        print(f"Outward direction: {'positive' if outward_sign > 0 else 'negative'} Y")
-        
-    else:  # normal_axis == 'z'
-        face_z = (face_bbox.ZMin + face_bbox.ZMax) / 2
-        extend_positive = source_clapboard_bbox.ZMax - face_z
-        extend_negative = face_z - source_clapboard_bbox.ZMin
-        if extend_positive > 0.01:
-            outward_sign = 1.0
-        elif extend_negative > 0.01:
-            outward_sign = -1.0
-        else:
-            outward_sign = 1.0 if extend_positive > extend_negative else -1.0
-        face_normal = Vector(0, 0, outward_sign)
-        print(f"Source face at Z={face_z:.2f}, clapboard Z range: {source_clapboard_bbox.ZMin:.2f} to {source_clapboard_bbox.ZMax:.2f}")
-        print(f"Extends beyond face: +Z by {extend_positive:.2f}, -Z by {extend_negative:.2f}")
-        print(f"Outward direction: {'positive' if outward_sign > 0 else 'negative'} Z")
-    
-    print(f"Face normal for trim: ({face_normal.x:.3f}, {face_normal.y:.3f}, {face_normal.z:.3f})")
-    
-    edges = get_face_edges(face)
-    print(f"Found {len(edges)} edges")
-    
-    has_misalignment, problem_edges = detect_punchout_misalignment(edges, bbox)
-    
-    if has_misalignment:
-        raise ValueError(
-            f"⚠️  PUNCHOUT MISALIGNMENT DETECTED!\n"
-            f"   Face has {len(problem_edges)} edge(s) that cross the wall boundary.\n"
-            f"   This suggests a boolean cut (window/door punchout) doesn't align\n"
-            f"   properly with the wall edge.\n"
-            f"   Problem edge indices: {problem_edges}\n"
-            f"   Please fix the punchout geometry and re-run smart trim.\n"
-        )
-    
-    classifications = classify_edges(edges, vertical_axis=vertical_axis, angle_tolerance=5.0)
-    
-    print(f"  Checking edges against bbox perimeter (normal_axis={normal_axis})...")
-    
-    corner_trim_parts = []
-    eave_trim_parts = []
-    gable_trim_parts = []
-    
-    for edge_idx, classification in classifications:
-        edge_dict = edges[edge_idx]
-        edge = edge_dict['edge_obj']
-        
-        is_perim = is_perimeter_edge(edge, bbox, normal_axis, tolerance=0.1)
-        
-        if not is_perim:
-            print(f"  Edge {edge_idx}: SKIPPED (notch/hole edge) - length {edge.Length:.2f}mm")
-            continue
-        
-        start = edge.valueAt(edge.FirstParameter)
-        end = edge.valueAt(edge.LastParameter)
-        
-        if vertical_axis == 'z':
-            at_bottom = abs(start.z - bbox.ZMin) < 0.1 and abs(end.z - bbox.ZMin) < 0.1
-        elif vertical_axis == 'y':
-            at_bottom = abs(start.y - bbox.YMin) < 0.1 and abs(end.y - bbox.YMin) < 0.1
-        else:  # 'x'
-            at_bottom = abs(start.x - bbox.XMin) < 0.1 and abs(end.x - bbox.XMin) < 0.1
-        
-        if at_bottom:
-            print(f"  Edge {edge_idx}: SKIPPED (bottom edge) - length {edge.Length:.2f}mm")
-            continue
-        
-        if classification == 'vertical':
-            print(f"  Edge {edge_idx}: VERTICAL (corner trim) - length {edge.Length:.2f}mm")
-            try:
-                trim = create_trim_along_edge(edge, vertical_axis, face_normal, 
-                                             trim_width, trim_thickness)
-                if trim:
-                    corner_trim_parts.append(trim)
-            except Exception as e:
-                print(f"    Warning: Failed to create corner trim: {e}")
-        
-        elif classification == 'horizontal':
-            print(f"  Edge {edge_idx}: HORIZONTAL (eave trim) - length {edge.Length:.2f}mm")
-            try:
-                trim = create_trim_along_edge(edge, vertical_axis, face_normal,
-                                             trim_width, trim_thickness)
-                if trim:
-                    eave_trim_parts.append(trim)
-            except Exception as e:
-                print(f"    Warning: Failed to create eave trim: {e}")
-        
-        elif classification == 'gable':
-            print(f"  Edge {edge_idx}: GABLE (diagonal) - length {edge.Length:.2f}mm")
-            try:
-                trim = create_trim_along_edge(edge, vertical_axis, face_normal,
-                                             trim_width, trim_thickness)
-                if trim:
-                    gable_trim_parts.append(trim)
-            except Exception as e:
-                print(f"    Warning: Failed to create gable trim: {e}")
-    
-    corner_trim = None
-    eave_trim = None
-    gable_trim = None
-    
-    if corner_trim_parts:
-        print(f"\nFusing {len(corner_trim_parts)} corner trim parts...")
-        corner_trim = corner_trim_parts[0]
-        for part in corner_trim_parts[1:]:
-            try:
-                corner_trim = corner_trim.fuse(part)
-            except Exception as e:
-                print(f"  Warning: Fuse failed: {e}")
-    
-    if eave_trim_parts:
-        print(f"Fusing {len(eave_trim_parts)} eave trim parts...")
-        eave_trim = eave_trim_parts[0]
-        for part in eave_trim_parts[1:]:
-            try:
-                eave_trim = eave_trim.fuse(part)
-            except Exception as e:
-                print(f"  Warning: Fuse failed: {e}")
-    
-    if gable_trim_parts:
-        print(f"Fusing {len(gable_trim_parts)} gable trim parts...")
-        gable_trim = gable_trim_parts[0]
-        for part in gable_trim_parts[1:]:
-            try:
-                gable_trim = gable_trim.fuse(part)
-            except Exception as e:
-                print(f"  Warning: Fuse failed: {e}")
-    
-    if selected_obj is not None and selected_obj.TypeId == 'Part::Mirroring':
-        mirror_base = selected_obj.Base
-        mirror_normal = selected_obj.Normal
-        print(f"\nApplying mirror transformation...")
-        
-        if corner_trim:
-            corner_trim = corner_trim.mirror(mirror_base, mirror_normal)
-        if eave_trim:
-            eave_trim = eave_trim.mirror(mirror_base, mirror_normal)
-        if gable_trim:
-            gable_trim = gable_trim.mirror(mirror_base, mirror_normal)
-    
-    return corner_trim, eave_trim, gable_trim
-
-
-if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins__':
-    doc = App.activeDocument()
-    if doc is None:
-        App.Console.PrintError("No active document!\n")
-    else:
-        try:
-            import FreeCADGui
-            selection_ex = FreeCADGui.Selection.getSelectionEx()
-            
-            if len(selection_ex) == 0:
-                App.Console.PrintError("No object selected!\n")
-                App.Console.PrintError("Please select one or more clapboard or shingle objects.\n")
-            else:
-                if len(selection_ex) > 1:
-                    App.Console.PrintMessage(f"\n=== Processing {len(selection_ex)} objects ===\n")
-                
-                params = get_params_from_spreadsheet(doc)
-                
-                if params:
-                    trim_width = params.get('trim_width', 2.0)
-                    trim_thickness = params.get('trim_thickness', 1.0)
-                    print(f"Using parameters from spreadsheet")
-                else:
-                    trim_width = 2.0
-                    trim_thickness = 1.0
-                    print(f"Using HO scale defaults")
-                
-                print(f"Trim width: {trim_width}mm, thickness: {trim_thickness}mm")
-                
-                success_count = 0
-                fail_count = 0
-                
-                for sel_obj in selection_ex:
-                    selected_obj = sel_obj.Object
-                    
-                    print(f"\n{'='*72}")
-                    print(f"  Smart Trim Generator v{VERSION}")
-                    print(f"{'='*72}")
-                    print(f"\nSelected: {selected_obj.Label}")
-                    
-                    try:
-                        source_obj, face_index, clapboard_obj = get_source_object_and_face(doc, selected_obj)
-                        print(f"Source object: {source_obj.Label}")
-                        print(f"Face index: {face_index}")
-                        print(f"Clapboard object: {clapboard_obj.Label}")
-                    except ValueError as e:
-                        App.Console.PrintError(f"Error: {e}\n")
-                        fail_count += 1
-                        continue
-                    
-                    is_valid, errors = validate_trim_parameters(trim_width, trim_thickness)
-                    if not is_valid:
-                        for error in errors:
-                            App.Console.PrintError(f"  {error}\n")
-                        fail_count += 1
-                        continue
-                    
-                    try:
-                        corner_trim, eave_trim, gable_trim = generate_trim(
-                            clapboard_obj, face_index, trim_width, trim_thickness,
-                            selected_obj=selected_obj
-                        )
-                        
-                        compound_parts = []
-                        
-                        if corner_trim:
-                            corner_obj = doc.addObject("Part::Feature",
-                                                       f"SmartTrim_{selected_obj.Name}_Vertical")
-                            corner_obj.Shape = corner_trim
-                            compound_parts.append(corner_obj)
-                            print(f"\n✓ Created: {corner_obj.Label}")
-                        
-                        if eave_trim:
-                            eave_obj = doc.addObject("Part::Feature",
-                                                     f"SmartTrim_{selected_obj.Name}_Eave")
-                            eave_obj.Shape = eave_trim
-                            compound_parts.append(eave_obj)
-                            print(f"✓ Created: {eave_obj.Label}")
-                        
-                        if gable_trim:
-                            gable_obj = doc.addObject("Part::Feature",
-                                                      f"SmartTrim_{selected_obj.Name}_Gable")
-                            gable_obj.Shape = gable_trim
-                            compound_parts.append(gable_obj)
-                            print(f"✓ Created: {gable_obj.Label}")
-                        
-                        if not compound_parts:
-                            App.Console.PrintWarning("No trim parts generated!\n")
-                            fail_count += 1
-                        else:
-                            compound = doc.addObject("Part::Compound",
-                                                    f"SmartTrim_{selected_obj.Name}")
-                            compound.Links = compound_parts
-                            print(f"\n✓ Created compound: {compound.Label}")
-                            print(f"  ({len(compound_parts)} trim components)")
-                            success_count += 1
-                        
-                    except Exception as e:
-                        App.Console.PrintError(f"Error generating trim: {e}\n")
-                        import traceback
-                        traceback.print_exc()
-                        fail_count += 1
-                
-                doc.recompute()
-                
-                if len(selection_ex) > 1:
-                    App.Console.PrintMessage(f"\n=== SUMMARY: {success_count} succeeded, {fail_count} failed ===\n")
-        
+            trim_pieces = tg.generate_trim_for_face(face, profile)
+            all_trim_pieces.extend(trim_pieces)
+            print(f"  ✓ Generated {len(trim_pieces)} trim segments")
         except Exception as e:
-            App.Console.PrintError(f"Unexpected error: {e}\n")
+            print(f"  ✗ Error generating trim: {e}")
             import traceback
             traceback.print_exc()
+    
+    if not all_trim_pieces:
+        raise RuntimeError("No trim pieces were generated")
+    
+    # Create compound
+    compound = Part.makeCompound(all_trim_pieces)
+    
+    print(f"\n{'='*72}")
+    print(f"✓ Trim generation complete: {len(all_trim_pieces)} total pieces")
+    print(f"{'='*72}\n")
+    
+    return compound
+
+
+# ==============================================================================
+# MAIN MACRO ENTRY POINT
+# ==============================================================================
+
+def extract_base_face_from_clapboard(obj):
+    """
+    Extract the underlying wall face from a clapboard compound.
+    
+    Looks for the sketch that was used to generate the clapboards,
+    then extracts its face.
+    """
+    # Check if object has BaseFeature (might be a PartDesign object)
+    if hasattr(obj, 'BaseFeature') and obj.BaseFeature:
+        base = obj.BaseFeature
+        if hasattr(base, 'Shape'):
+            # Return the largest face (should be the wall)
+            faces = base.Shape.Faces
+            if faces:
+                return max(faces, key=lambda f: f.Area)
+    
+    # Check if object has a Sketch property
+    if hasattr(obj, 'Sketch') and obj.Sketch:
+        sketch = obj.Sketch
+        if hasattr(sketch, 'Shape'):
+            faces = sketch.Shape.Faces
+            if faces:
+                return faces[0]  # Sketch should have one face
+    
+    # Check if object has dependencies (might reference a sketch)
+    if hasattr(obj, 'InList'):
+        for parent in obj.InList:
+            if parent.TypeId == 'Sketcher::SketchObject':
+                if hasattr(parent, 'Shape'):
+                    faces = parent.Shape.Faces
+                    if faces:
+                        return faces[0]
+    
+    # Last resort: return the largest planar face from the compound
+    if hasattr(obj, 'Shape') and obj.Shape.Faces:
+        # Filter for large, planar faces (likely walls, not trim details)
+        planar_faces = []
+        for face in obj.Shape.Faces:
+            try:
+                if face.Surface.TypeId == 'Part::GeomPlane':
+                    planar_faces.append(face)
+            except:
+                pass
+        
+        if planar_faces:
+            # Return largest planar face
+            return max(planar_faces, key=lambda f: f.Area)
+    
+    return None
+
+
+def main():
+    """Main macro entry point."""
+    
+    # Get selection
+    sel = Gui.Selection.getSelectionEx()
+    
+    if not sel:
+        App.Console.PrintError("No objects selected! Please select clapboard object or wall face.\n")
+        return
+    
+    # Debug: show what we got
+    print(f"\n=== Selection Debug ===")
+    print(f"Number of selected objects: {len(sel)}")
+    
+    # Collect all selected faces
+    selected_faces = []
+    for i, sel_obj in enumerate(sel):
+        print(f"\nSelection {i+1}:")
+        print(f"  Object: {sel_obj.Object.Label if sel_obj.Object else 'None'}")
+        print(f"  HasSubObjects: {sel_obj.HasSubObjects}")
+        
+        if sel_obj.HasSubObjects:
+            # User selected a specific sub-object (face, edge, etc.)
+            print(f"  SubObjects: {len(sel_obj.SubObjects)}")
+            for j, sub_obj in enumerate(sel_obj.SubObjects):
+                print(f"    SubObject {j+1}: {sub_obj.ShapeType}")
+                if sub_obj.ShapeType == "Face":
+                    selected_faces.append(sub_obj)
+                    print(f"      ✓ Added face")
+        else:
+            # Whole object selected - extract base face
+            obj = sel_obj.Object
+            print(f"  Object type: {obj.TypeId if hasattr(obj, 'TypeId') else 'Unknown'}")
+            print(f"  Has Shape: {hasattr(obj, 'Shape')}")
+            
+            # Try to extract base face from clapboard compound
+            base_face = extract_base_face_from_clapboard(obj)
+            
+            if base_face:
+                print(f"  ✓ Extracted wall face from {obj.Label}")
+                selected_faces.append(base_face)
+            elif hasattr(obj, 'Shape'):
+                # Fall back to all faces
+                num_faces = len(obj.Shape.Faces)
+                print(f"  Fallback: found {num_faces} faces in shape")
+                for face in obj.Shape.Faces:
+                    selected_faces.append(face)
+                    print(f"    ✓ Added face (Area: {face.Area:.2f})")
+    
+    print(f"\n=== Total faces collected: {len(selected_faces)} ===\n")
+    
+    if not selected_faces:
+        App.Console.PrintError("No faces found in selection!\n")
+        return
+    
+    print(f"Selected {len(selected_faces)} face(s)")
+    
+    # Get or create document
+    doc = App.ActiveDocument
+    if not doc:
+        doc = App.newDocument("TrimProject")
+    
+    # Generate trim with default parameters
+    try:
+        trim_compound = generate_trim(selected_faces, DEFAULT_PARAMS)
+    except Exception as e:
+        App.Console.PrintError(f"Error generating trim: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    # Create FreeCAD object
+    trim_obj = doc.addObject("Part::Feature", "Trim")
+    trim_obj.Shape = trim_compound
+    trim_obj.ViewObject.ShapeColor = (0.8, 0.6, 0.4)  # Wood color
+    
+    # Create parameter spreadsheet
+    params_ss = create_parameter_spreadsheet(trim_obj, DEFAULT_PARAMS)
+    
+    # Link to group if we want organization
+    # (Could add group creation here)
+    
+    doc.recompute()
+    
+    App.Console.PrintMessage("\n✓ Smart Trim object created successfully!\n")
+    App.Console.PrintMessage(f"  Adjust parameters in '{params_ss.Name}' and recompute.\n\n")
+    
+    # Fit view
+    Gui.SendMsgToActiveView("ViewFit")
+
+
+# Run the macro
+if __name__ == '__main__':
+    main()
