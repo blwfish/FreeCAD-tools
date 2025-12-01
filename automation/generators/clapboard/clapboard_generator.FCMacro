@@ -462,14 +462,10 @@ def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_t
     
     print(f"Cut {holes_cut}/{len(hole_wires)} holes")
     
-    # Fuse clapboards to source wall
-    print(f"\nFusing clapboards to source wall '{source_object.Label}'...")
-    try:
-        combined = source_object.Shape.fuse(final_clapboards)
-        print(f"Fused result volume: {combined.Volume:.2f} mm³")
-        return combined
-    except Exception as e:
-        raise RuntimeError(f"Failed to fuse clapboards to source wall: {e}")
+    # Return only the clapboard skin geometry (don't fuse with source wall)
+    print(f"\nClapboard siding complete (compounding with source wall in document)")
+    print(f"Clapboard volume: {final_clapboards.Volume:.2f} mm³")
+    return final_clapboards
 
 
 # Main execution
@@ -506,24 +502,34 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
             
             for source_obj, face, face_idx in faces_list:
                 try:
-                    wall_compound = create_clapboard_wall(
+                    clapboard_skin = create_clapboard_wall(
                         face, source_obj, clapboard_height, clapboard_thickness
                     )
                     
-                    wall_obj = doc.addObject("Part::Feature", 
-                                            f"ClapboardWall_{source_obj.Label}_F{face_idx}")
-                    wall_obj.Shape = wall_compound
+                    # Create a compound containing the source wall and the clapboard skin
+                    compound_obj = doc.addObject("Part::Compound", 
+                                                f"ClapboardWall_{source_obj.Label}_F{face_idx}")
                     
-                    wall_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata")
-                    wall_obj.GeneratorName = GENERATOR_NAME
-                    wall_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata")
-                    wall_obj.GeneratorVersion = VERSION
-                    wall_obj.addProperty("App::PropertyString", "SourceObject", "Metadata")
-                    wall_obj.SourceObject = source_obj.Label
-                    wall_obj.addProperty("App::PropertyInteger", "FaceIndex", "Metadata")
-                    wall_obj.FaceIndex = face_idx
+                    # Add source wall reference and clapboard skin to compound
+                    compound_obj.Links = [source_obj]
                     
-                    App.Console.PrintMessage(f"✓ '{wall_obj.Label}' created\n")
+                    # Create a separate feature object for the clapboard skin geometry
+                    skin_obj = doc.addObject("Part::Feature", 
+                                            f"ClapboardWall_{source_obj.Label}_F{face_idx}_skin")
+                    skin_obj.Shape = clapboard_skin
+                    skin_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata")
+                    skin_obj.GeneratorName = GENERATOR_NAME
+                    skin_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata")
+                    skin_obj.GeneratorVersion = VERSION
+                    skin_obj.addProperty("App::PropertyString", "SourceObject", "Metadata")
+                    skin_obj.SourceObject = source_obj.Label
+                    skin_obj.addProperty("App::PropertyInteger", "FaceIndex", "Metadata")
+                    skin_obj.FaceIndex = face_idx
+                    
+                    # Update compound to reference both
+                    compound_obj.Links = [source_obj, skin_obj]
+                    
+                    App.Console.PrintMessage(f"✓ '{compound_obj.Label}' created with skin geometry\n")
                     success_count += 1
                     
                 except Exception as e:

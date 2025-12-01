@@ -1,5 +1,5 @@
 """
-Smart Trim Generator for FreeCAD v1.0.4
+Smart Trim Generator for FreeCAD v1.0.9
 
 Applies parametric trim (corner boards, eave trim, gable trim) to wall faces
 that have been decorated with clapboard or shingles.
@@ -8,7 +8,21 @@ Author: Generated for model railroading (HO/O/N scale)
 Usage: Select a clapboard or shingle object, then run this macro
 
 Version History:
-- 1.0.4: Fixed mirror object handling in generate_trim
+- 1.0.9: Fixed outward direction for source clapboards
+         - Clapboard geometry extends on BOTH sides of face (mostly into wall)
+         - Now checks which direction clapboard extends BEYOND the face
+         - The side that protrudes past the face is the outward direction
+- 1.0.8: Fixed outward direction detection for all cases
+- 1.0.7: Rewrote outward direction detection
+         - Now uses bounding box comparison between clapboard/mirror and source wall
+         - Detects which direction the clapboard protrudes from the wall
+         - Works correctly for both source clapboards and mirrors
+         - Fixes trim appearing on wrong side or inside wall
+- 1.0.6: Fixed mirror normal direction
+         - Trim was appearing inside the wall on mirrored objects
+         - Now flips normal before generating trim for mirrors so that
+           after the mirror transformation, trim is on the outside
+- 1.0.5: Fixed two critical issues
          - Now properly resolves mirror objects to get the original clapboard properties
          - get_source_object_and_face now returns (source_obj, face_index, clapboard_obj)
 - 1.0.3: Fixed edge detection to analyze source wall face
@@ -35,7 +49,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.0.4"
+VERSION = "1.0.9"
 GENERATOR_NAME = "smart_trim_generator"
 
 # Import the geometry library
@@ -61,7 +75,6 @@ try:
     
     from smart_trim_geometry import (
         classify_edges,
-        filter_edges_for_trim,
         get_edge_length,
         validate_trim_parameters,
     )
@@ -349,6 +362,60 @@ def classify_edge_location(edge, bbox, tolerance=0.01):
         return 'interior'
 
 
+def is_perimeter_edge(edge_obj, bbox, normal_axis, tolerance=0.1):
+    """
+    Check if an edge lies on the outer perimeter of the face bounding box.
+    
+    This is a more robust check than signature matching. An edge is on the
+    perimeter if it lies entirely along one of the bbox boundaries (not just
+    having endpoints on *some* boundary).
+    
+    For a wall face:
+    - The face lies in a plane (one axis is constant - the normal_axis)
+    - Perimeter edges are at the min/max of the other two axes
+    - Notch edges (door cutouts to floor) are interior to the bbox
+    
+    Args:
+        edge_obj: FreeCAD Edge object
+        bbox: FreeCAD BoundBox of the face
+        normal_axis: 'x', 'y', or 'z' - the axis perpendicular to the face
+        tolerance: Distance tolerance in mm
+    
+    Returns:
+        True if edge is on the outer perimeter, False if it's a notch/hole edge
+    """
+    start = edge_obj.valueAt(edge_obj.FirstParameter)
+    end = edge_obj.valueAt(edge_obj.LastParameter)
+    
+    # Determine which two axes define the face plane
+    if normal_axis == 'x':
+        # Face is in YZ plane
+        # Perimeter edges are at Y=YMin, Y=YMax, Z=ZMin, or Z=ZMax
+        at_ymin = abs(start.y - bbox.YMin) < tolerance and abs(end.y - bbox.YMin) < tolerance
+        at_ymax = abs(start.y - bbox.YMax) < tolerance and abs(end.y - bbox.YMax) < tolerance
+        at_zmin = abs(start.z - bbox.ZMin) < tolerance and abs(end.z - bbox.ZMin) < tolerance
+        at_zmax = abs(start.z - bbox.ZMax) < tolerance and abs(end.z - bbox.ZMax) < tolerance
+        return at_ymin or at_ymax or at_zmin or at_zmax
+    
+    elif normal_axis == 'y':
+        # Face is in XZ plane
+        # Perimeter edges are at X=XMin, X=XMax, Z=ZMin, or Z=ZMax
+        at_xmin = abs(start.x - bbox.XMin) < tolerance and abs(end.x - bbox.XMin) < tolerance
+        at_xmax = abs(start.x - bbox.XMax) < tolerance and abs(end.x - bbox.XMax) < tolerance
+        at_zmin = abs(start.z - bbox.ZMin) < tolerance and abs(end.z - bbox.ZMin) < tolerance
+        at_zmax = abs(start.z - bbox.ZMax) < tolerance and abs(end.z - bbox.ZMax) < tolerance
+        return at_xmin or at_xmax or at_zmin or at_zmax
+    
+    else:  # normal_axis == 'z'
+        # Face is in XY plane
+        # Perimeter edges are at X=XMin, X=XMax, Y=YMin, or Y=YMax
+        at_xmin = abs(start.x - bbox.XMin) < tolerance and abs(end.x - bbox.XMin) < tolerance
+        at_xmax = abs(start.x - bbox.XMax) < tolerance and abs(end.x - bbox.XMax) < tolerance
+        at_ymin = abs(start.y - bbox.YMin) < tolerance and abs(end.y - bbox.YMin) < tolerance
+        at_ymax = abs(start.y - bbox.YMax) < tolerance and abs(end.y - bbox.YMax) < tolerance
+        return at_xmin or at_xmax or at_ymin or at_ymax
+
+
 def get_face_edges(face):
     """
     Extract edges from a face's outer wire.
@@ -533,20 +600,25 @@ def create_trim_along_edge(edge, vertical_axis, normal_direction,
             return None
 
 
-def generate_trim(clapboard_obj, face_index, trim_width=2.0, trim_thickness=1.0):
+def generate_trim(clapboard_obj, face_index, trim_width=2.0, trim_thickness=1.0, 
+                  selected_obj=None):
     """
     Generate corner, eave, and gable trim for a clapboard face.
     
     Args:
-        clapboard_obj: The clapboard or shingle object (can be original or mirror)
+        clapboard_obj: The clapboard or shingle object (resolved from mirror if needed)
         face_index: Which face of the SOURCE WALL to analyze for trim
         trim_width: Width of trim boards
         trim_thickness: Thickness of trim boards
+        selected_obj: The originally selected object (may be Part::Mirroring)
+                      Used to apply mirror transformation to output geometry
     
     Returns:
         Tuple of (corner_trim_shape, eave_trim_shape, gable_trim_shape)
         (any can be None if no edges of that type)
     """
+    # Check if we'll be mirroring the output
+    is_mirror = (selected_obj is not None and selected_obj.TypeId == 'Part::Mirroring')
     print(f"\nGenerating smart trim for face {face_index}...")
     
     # CRITICAL: We need to analyze the SOURCE WALL face to detect holes/edges,
@@ -584,35 +656,91 @@ def generate_trim(clapboard_obj, face_index, trim_width=2.0, trim_thickness=1.0)
     
     print(f"Face orientation: vertical={vertical_axis}, horizontal={horizontal_axis}")
     
-    # Get face normal
-    u_range = face.ParameterRange[:2]
-    v_range = face.ParameterRange[2:]
-    u_mid = (u_range[0] + u_range[1]) / 2
-    v_mid = (v_range[0] + v_range[1]) / 2
-    face_normal = face.normalAt(u_mid, v_mid)
+    # Determine the OUTWARD direction for trim.
+    # 
+    # Strategy: Compare the selected object's (clapboard or mirror) bounding box
+    # to the source wall's bounding box. The clapboard protrudes from the wall
+    # in the "outward" direction, so we can detect which way that is.
+    #
+    # For the selected object (mirror or original), trim should extend AWAY
+    # from the building center, which is the direction the clapboards protrude.
     
-    print(f"Face normal: ({face_normal.x:.3f}, {face_normal.y:.3f}, {face_normal.z:.3f})")
+    from FreeCAD import Vector
     
-    # Check if normal is pointing outward (positive) or inward (negative)
-    # For a wall on the XZ plane (normal in Y), positive Y is outward
-    # For a wall on the YZ plane (normal in X), positive X is outward
-    # etc. Check the sign of the normal component for the normal_axis
+    # Get the face position on the normal axis (from source wall)
+    face_bbox = face.BoundBox
+    
+    # Strategy:
+    # The clapboard geometry straddles the wall face - it extends slightly beyond
+    # the face (the visible clapboard surface) and also into the wall (for attachment).
+    # The "outward" direction is the direction where the clapboard extends BEYOND the face.
+    #
+    # Compare clapboard min/max to face position:
+    # - If clapboard max > face position: outward is positive
+    # - If clapboard min < face position: outward is negative
+    # The one that extends further beyond the face is the outward direction.
+    
+    source_clapboard_bbox = clapboard_obj.Shape.BoundBox
     
     if normal_axis == 'x':
-        normal_sign = face_normal.x
+        face_x = (face_bbox.XMin + face_bbox.XMax) / 2
+        
+        # How far does clapboard extend beyond face in each direction?
+        extend_positive = source_clapboard_bbox.XMax - face_x  # positive if extends in +X
+        extend_negative = face_x - source_clapboard_bbox.XMin  # positive if extends in -X
+        
+        # The outward direction is where it extends more (the visible surface)
+        # Actually, it's where it extends AT ALL beyond the face
+        if extend_positive > 0.01:  # Extends beyond face in positive direction
+            outward_sign = 1.0
+        elif extend_negative > 0.01:  # Extends beyond face in negative direction
+            outward_sign = -1.0
+        else:
+            # Fallback: use whichever side extends more
+            outward_sign = 1.0 if extend_positive > extend_negative else -1.0
+        
+        face_normal = Vector(outward_sign, 0, 0)
+        print(f"Source face at X={face_x:.2f}, clapboard X range: {source_clapboard_bbox.XMin:.2f} to {source_clapboard_bbox.XMax:.2f}")
+        print(f"Extends beyond face: +X by {extend_positive:.2f}, -X by {extend_negative:.2f}")
+        print(f"Outward direction: {'positive' if outward_sign > 0 else 'negative'} X")
+        
     elif normal_axis == 'y':
-        normal_sign = face_normal.y
-    else:  # 'z'
-        normal_sign = face_normal.z
+        face_y = (face_bbox.YMin + face_bbox.YMax) / 2
+        
+        extend_positive = source_clapboard_bbox.YMax - face_y
+        extend_negative = face_y - source_clapboard_bbox.YMin
+        
+        if extend_positive > 0.01:
+            outward_sign = 1.0
+        elif extend_negative > 0.01:
+            outward_sign = -1.0
+        else:
+            outward_sign = 1.0 if extend_positive > extend_negative else -1.0
+        
+        face_normal = Vector(0, outward_sign, 0)
+        print(f"Source face at Y={face_y:.2f}, clapboard Y range: {source_clapboard_bbox.YMin:.2f} to {source_clapboard_bbox.YMax:.2f}")
+        print(f"Extends beyond face: +Y by {extend_positive:.2f}, -Y by {extend_negative:.2f}")
+        print(f"Outward direction: {'positive' if outward_sign > 0 else 'negative'} Y")
+        
+    else:  # normal_axis == 'z'
+        face_z = (face_bbox.ZMin + face_bbox.ZMax) / 2
+        
+        extend_positive = source_clapboard_bbox.ZMax - face_z
+        extend_negative = face_z - source_clapboard_bbox.ZMin
+        
+        if extend_positive > 0.01:
+            outward_sign = 1.0
+        elif extend_negative > 0.01:
+            outward_sign = -1.0
+        else:
+            outward_sign = 1.0 if extend_positive > extend_negative else -1.0
+        
+        face_normal = Vector(0, 0, outward_sign)
+        print(f"Source face at Z={face_z:.2f}, clapboard Z range: {source_clapboard_bbox.ZMin:.2f} to {source_clapboard_bbox.ZMax:.2f}")
+        print(f"Extends beyond face: +Z by {extend_positive:.2f}, -Z by {extend_negative:.2f}")
+        print(f"Outward direction: {'positive' if outward_sign > 0 else 'negative'} Z")
     
-    # Check if normal is pointing outward (positive) or inward (negative)
-    # If positive, it's already pointing the right way
-    # If negative, flip it
-    if normal_sign > 0:
-        print(f"Normal pointing outward (positive {normal_axis}), flipping to inward for consistent trim direction...")
-        from FreeCAD import Vector
-        face_normal = Vector(-face_normal.x, -face_normal.y, -face_normal.z)
-        print(f"After flip: ({face_normal.x:.3f}, {face_normal.y:.3f}, {face_normal.z:.3f})")
+    print(f"Face normal for trim: ({face_normal.x:.3f}, {face_normal.y:.3f}, {face_normal.z:.3f})")
     
     # Get edges
     edges = get_face_edges(face)
@@ -631,53 +759,47 @@ def generate_trim(clapboard_obj, face_index, trim_width=2.0, trim_thickness=1.0)
             f"   Please fix the punchout geometry and re-run smart trim.\n"
         )
     
-    # Classify edge locations (boundary vs interior/hole)
-    edge_locations = []
-    for edge in edges:
-        location = classify_edge_location(edge, bbox)
-        edge_locations.append(location)
-    
-    # Count interior edges (holes)
-    interior_count = sum(1 for loc in edge_locations if loc == 'interior')
-    if interior_count > 0:
-        print(f"  Detected {interior_count} interior edges (holes) - will skip for trim")
-    
-    # Classify edges
+    # Classify edges by direction (vertical/horizontal/gable)
     classifications = classify_edges(edges, vertical_axis=vertical_axis, angle_tolerance=5.0)
     
-    # Get hole wires from face (for sketch-based holes)
-    # For boolean punchouts, we use the bbox-based classification above
-    hole_wires = []
-    
-    if len(face.Wires) > 1:
-        hole_wires = face.Wires[1:]
-        print(f"  Found {len(hole_wires)} hole wires (sketch-based)")
-    
-    # Filter edges (skip bottom and hole edges)
-    filtering = filter_edges_for_trim(
-        edges, 
-        face_wires=hole_wires,
-        vertical_axis=vertical_axis,
-        skip_bottom=True
-    )
+    # Determine perimeter vs notch edges using robust bbox check
+    # This catches both:
+    #   - Hole wires (interior windows) - edges not on bbox boundary
+    #   - Outer wire notches (doors to floor) - edges interior to bbox in one axis
+    print(f"  Checking edges against bbox perimeter (normal_axis={normal_axis})...")
     
     # Separate edges by type
     corner_trim_parts = []
     eave_trim_parts = []
     gable_trim_parts = []
     
-    for (edge_idx, classification), (filter_idx, should_trim), location in zip(classifications, filtering, edge_locations):
-        # Skip interior edges (holes from boolean punchouts)
-        if location == 'interior':
-            print(f"  Edge {edge_idx}: SKIPPED (interior/hole edge)")
+    for edge_idx, classification in classifications:
+        edge_dict = edges[edge_idx]
+        edge = edge_dict['edge_obj']
+        
+        # Check if this edge is on the building perimeter
+        is_perim = is_perimeter_edge(edge, bbox, normal_axis, tolerance=0.1)
+        
+        if not is_perim:
+            print(f"  Edge {edge_idx}: SKIPPED (notch/hole edge) - length {edge.Length:.2f}mm")
             continue
         
-        if not should_trim:
-            print(f"  Edge {edge_idx}: SKIPPED (bottom edge)")
+        # Skip bottom edges (at minimum vertical position)
+        start = edge.valueAt(edge.FirstParameter)
+        end = edge.valueAt(edge.LastParameter)
+        
+        if vertical_axis == 'z':
+            at_bottom = abs(start.z - bbox.ZMin) < 0.1 and abs(end.z - bbox.ZMin) < 0.1
+        elif vertical_axis == 'y':
+            at_bottom = abs(start.y - bbox.YMin) < 0.1 and abs(end.y - bbox.YMin) < 0.1
+        else:  # 'x'
+            at_bottom = abs(start.x - bbox.XMin) < 0.1 and abs(end.x - bbox.XMin) < 0.1
+        
+        if at_bottom:
+            print(f"  Edge {edge_idx}: SKIPPED (bottom edge) - length {edge.Length:.2f}mm")
             continue
         
-        edge = edges[edge_idx]['edge_obj']
-        
+        # Generate trim for this edge
         if classification == 'vertical':
             print(f"  Edge {edge_idx}: VERTICAL (corner trim) - length {edge.Length:.2f}mm")
             try:
@@ -739,6 +861,19 @@ def generate_trim(clapboard_obj, face_index, trim_width=2.0, trim_thickness=1.0)
                 gable_trim = gable_trim.fuse(part)
             except Exception as e:
                 print(f"  Warning: Fuse failed: {e}")
+    
+    # Apply mirror transformation if selected object is a Part::Mirroring
+    if selected_obj is not None and selected_obj.TypeId == 'Part::Mirroring':
+        mirror_base = selected_obj.Base
+        mirror_normal = selected_obj.Normal
+        print(f"\nApplying mirror transformation (base={mirror_base}, normal={mirror_normal})...")
+        
+        if corner_trim:
+            corner_trim = corner_trim.mirror(mirror_base, mirror_normal)
+        if eave_trim:
+            eave_trim = eave_trim.mirror(mirror_base, mirror_normal)
+        if gable_trim:
+            gable_trim = gable_trim.mirror(mirror_base, mirror_normal)
     
     return corner_trim, eave_trim, gable_trim
 
@@ -806,9 +941,11 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     # Generate trim
                     # Use clapboard_obj (mirror-resolved) for geometry
                     # source_obj is the wall for edge/hole analysis
+                    # selected_obj is passed to apply mirror transformation if needed
                     try:
                         corner_trim, eave_trim, gable_trim = generate_trim(
-                            clapboard_obj, face_index, trim_width, trim_thickness
+                            clapboard_obj, face_index, trim_width, trim_thickness,
+                            selected_obj=selected_obj
                         )
                         
                         # Create compound with sub-objects
