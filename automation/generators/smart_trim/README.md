@@ -1,17 +1,36 @@
-# Smart Trim Generator v1.0.4
+# Smart Trim Generator v1.0.9
 
 Parametric trim generator for FreeCAD. Applies corner boards, eave trim, and gable trim to walls that have been decorated with clapboard or shingles.
 
 ## Recent Changes
 
+**v1.0.9** - Fixed outward direction for source clapboards
+- Clapboard geometry extends on BOTH sides of the wall face (mostly into wall, slightly outward)
+- Now checks which direction the clapboard extends BEYOND the face position
+- The side that protrudes past the face is the true outward direction
+- Fixes all source (non-mirror) clapboards that had trim outside bounding box
+
+**v1.0.8** - Fixed outward direction for all cases
+- Now uses bounding box comparison between clapboard/mirror and source wall
+- Detects which direction the clapboard actually protrudes from the wall
+- Works correctly for both source clapboards and mirrors on any wall orientation
+- Fixes trim appearing on wrong side, inside wall, or outside bounding box
+
+**v1.0.6** - Fixed mirror normal direction
+- Trim was appearing inside the wall (wrong side) on mirrored objects
+- Now correctly flips normal before generating trim for mirrors
+- After mirror transformation, trim is on the outside where it belongs
+
+**v1.0.5** - Fixed two critical issues
+- **Mirror transformation**: Trim now appears at the mirror's location, not the source wall
+  - Applies `Shape.mirror()` transformation for `Part::Mirroring` objects
+- **Notch edge detection**: Door openings that extend to floor (notches in outer wire) are now correctly skipped
+  - Uses robust bbox perimeter check instead of fragile edge signature matching
+  - Edges 5, 6, 7 (door jambs/headers) now correctly skipped
+
 **v1.0.4** - Fixed mirror handling
 - Properly resolves mirror objects to access clapboard properties
 - Mirrors now work correctly with source wall face analysis
-
-**v1.0.3** - Fixed edge detection
-- Now correctly analyzes the source wall face (with holes) instead of individual clapboard board faces
-- This allows proper detection and skipping of window/door holes
-- Critical fix for hole detection to work properly
 
 **v1.0.2** - Punchout hole detection
 - Automatically detects and skips window/door holes created by boolean cuts
@@ -37,7 +56,7 @@ Parametric trim generator for FreeCAD. Applies corner boards, eave trim, and gab
 
 ### Quick Start (FreeCAD)
 
-1. Unzip `smart_trim_generator_v1.0.4.zip`
+1. Unzip `smart_trim_generator_v1.0.9.zip`
 2. Run: `python3 smart_trim_freecad_installer.py`
 3. Restart FreeCAD
 4. Done! The macro is ready to use

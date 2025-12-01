@@ -1,11 +1,16 @@
 """
-Smart Trim Geometry Library v1.0.0
+Smart Trim Geometry Library v1.0.1
 
 Pure Python geometry functions for detecting and classifying edges for trim application.
 Used by both clapboard_trim and shingle_trim generators.
 
 No dependencies on FreeCAD.Part, FreeCAD.Vector, etc.
 Uses standard Python types (tuples, dicts, lists) for I/O.
+
+Version History:
+- 1.0.1: Removed filter_edges_for_trim (replaced by is_perimeter_edge in macro)
+         The bbox-based perimeter check is more robust than signature matching
+- 1.0.0: Initial release
 
 Edge classification:
 - VERTICAL: edges aligned with the wall's vertical axis (within angle_tolerance)
