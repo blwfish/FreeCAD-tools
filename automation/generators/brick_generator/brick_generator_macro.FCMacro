@@ -1,0 +1,913 @@
+"""
+Parametric Brick Generator Macro v4.2.0
+
+Simplified UI layer that orchestrates brick generation using brick_geometry library.
+Handles FreeCAD coordinate systems, object creation, and automatic punchout generation.
+
+Openings (windows, doors): Automatically detected from face holes and punched out.
+No manual punchout step required - the generator produces fully finished bricked walls.
+
+Version History:
+- 4.2.0 (2024-12-02): ADD: Global 3D grid snapping for course alignment
+                      FIX: Brick courses now align across all coplanar faces
+                      FIX: Eliminates visible seams at face boundaries
+                      IMPROVEMENT: Snaps origin to global X/Y/Z grid based on brick+mortar dimensions
+- 4.1.0 (2024-12-02): ADD: Multi-face selection support (Ctrl+click faces)
+                      ADD: Single compound output from multiple selected faces
+                      ADD: Boundary trimming to prevent brick overflow
+                      FIX: Opening detection using face.Wires instead of face.Holes
+- 4.0.0 (2024-12-02): ADD: Automatic opening detection from face holes
+                      ADD: Automatic punchout generation and boolean cut
+                      CHANGE: Single output object with holes already punched
+                      FEATURE: Works seamlessly with arrayed walls containing holes
+- 3.1.0 (2024-12-02): ADD: Bay boundary detection for fused arrays
+                      CHANGE: Segments brick generation at detected boundaries
+                      COMPATIBLE: Works with both continuous walls and segmented bays
+- 3.0.0 (2025-11-26): Initial release with bond patterns
+
+Version: 4.2.0
+Date: 2024-12-02
+"""
+
+import FreeCAD as App
+import Part
+import math
+import sys
+import os
+
+# Try to import the geometry library
+# First try _lib/ subdirectory (standard installation location)
+# Then try same directory (fallback for manual installation)
+try:
+    from brick_geometry import BrickGeometry
+except ImportError:
+    # Try adding _lib to path
+    import sys
+    macro_dir = os.path.dirname(__file__)
+    lib_dir = os.path.join(macro_dir, '_lib')
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    
+    try:
+        from brick_geometry import BrickGeometry
+    except ImportError:
+        print("ERROR: Could not import brick_geometry module")
+        print(f"Looked in: {macro_dir}")
+        print(f"Looked in: {lib_dir}")
+        print("Make sure brick_geometry.py is in _lib/ subdirectory or same directory as macro")
+        sys.exit(1)
+
+
+def detect_openings_and_create_punchout(face, origin, u_vec, v_vec, normal, brick_depth):
+    """
+    Detect openings (holes) in the face and create punchout geometry.
+    
+    Openings are detected by checking for inner wires in the face.
+    A face with holes has an OuterWire (boundary) plus inner wires (holes).
+    Each hole is extruded perpendicular to the wall to create a punchout shape
+    that can be boolean cut from bricks.
+    
+    Args:
+        face: The wall face to analyze
+        origin: Wall origin point
+        u_vec: Horizontal direction vector
+        v_vec: Vertical direction vector
+        normal: Wall normal (perpendicular direction)
+        brick_depth: Depth to extrude punchouts
+        
+    Returns:
+        Part.Shape: Compound of punchout shapes, or None if no holes
+    """
+    # In FreeCAD, face.Wires contains all wires - OuterWire plus any holes
+    # If there's only one wire, there are no holes
+    all_wires = face.Wires
+    if len(all_wires) <= 1:
+        print("  No openings detected")
+        return None
+    
+    # Filter out the outer wire - it's the one with the largest area
+    # This is more reliable than direct comparison
+    outer_wire = face.OuterWire
+    
+    # Alternative: find largest wire by length (outer boundary is longest)
+    wire_lengths = [(w, w.Length) for w in all_wires]
+    wire_lengths.sort(key=lambda x: x[1], reverse=True)
+    largest_wire = wire_lengths[0][0]
+    
+    # Get inner wires (holes) - everything except the largest
+    hole_wires = [w for w, length in wire_lengths[1:]]
+    
+    if not hole_wires:
+        print("  No openings detected")
+        return None
+    
+    print(f"  Found {len(hole_wires)} opening(s) - creating punchout geometry...")
+    print(f"  DEBUG: Total wires={len(all_wires)}, holes={len(hole_wires)}")
+    punchout_shapes = []
+    
+    # Use generous 10mm extrusion depth (doesn't need to be precise)
+    punchout_depth = 10.0  # mm
+    
+    try:
+        for hole_idx, hole_wire in enumerate(hole_wires):
+            try:
+                # Create a face from the hole wire
+                hole_face = Part.Face(hole_wire)
+                
+                # Debug: show hole face area
+                area = hole_face.Area
+                bbox = hole_face.BoundBox
+                print(f"    Opening {hole_idx + 1}: area={area:.2f}mm², size={bbox.XLength:.1f}x{bbox.YLength:.1f}x{bbox.ZLength:.1f}mm")
+                
+                # Extrude generously in both directions (10mm each way = 20mm total)
+                # This ensures we punch through regardless of exact brick positioning
+                extrude_vec = scale_vector(normal, punchout_depth * 2)
+                start_offset = scale_vector(normal, -punchout_depth)
+                hole_face_translated = hole_face.translated(start_offset)
+                
+                # Create the punchout by extruding
+                punchout = hole_face_translated.extrude(extrude_vec)
+                punchout_shapes.append(punchout)
+                print(f"    Opening {hole_idx + 1}: punchout created (extruded {punchout_depth*2:.1f}mm total)")
+            except Exception as e:
+                print(f"    Opening {hole_idx + 1}: WARNING - Could not create punchout: {e}")
+                continue
+        
+        # Create compound of all punchouts
+        if punchout_shapes:
+            if len(punchout_shapes) == 1:
+                punchout_compound = punchout_shapes[0]
+            else:
+                punchout_compound = Part.Compound(punchout_shapes)
+            print(f"  ✓ Punchout geometry ready ({len(punchout_shapes)} opening(s))")
+            return punchout_compound
+            
+    except Exception as e:
+        print(f"  WARNING: Could not create punchout geometry: {e}")
+        print(f"  Continuing with bricks only (no holes)")
+        return None
+    
+    return None
+
+
+def snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar):
+    """
+    Snap face origin to global 3D grid to align brick courses across all faces.
+    
+    This ensures that brick courses and columns align perfectly across coplanar faces,
+    eliminating visible seams at face boundaries.
+    
+    Args:
+        origin: Face origin point (FreeCAD.Vector)
+        u_vec: Horizontal direction vector (normalized)
+        v_vec: Vertical direction vector (normalized)
+        brick_width: Brick width in mm
+        brick_height: Brick height in mm
+        mortar: Mortar thickness in mm
+        
+    Returns:
+        Snapped origin point (FreeCAD.Vector)
+    """
+    # Grid spacings
+    horizontal_grid = brick_width + mortar  # e.g., 2.43mm for stretcher bond
+    vertical_grid = brick_height + mortar    # e.g., 0.76mm
+    
+    # Global axes
+    global_x = App.Vector(1, 0, 0)
+    global_y = App.Vector(0, 1, 0)
+    global_z = App.Vector(0, 0, 1)
+    
+    # Project origin onto global axes
+    origin_x = origin.dot(global_x)
+    origin_y = origin.dot(global_y)
+    origin_z = origin.dot(global_z)
+    
+    # Snap to grid
+    snapped_x = round(origin_x / horizontal_grid) * horizontal_grid
+    snapped_y = round(origin_y / horizontal_grid) * horizontal_grid
+    snapped_z = round(origin_z / vertical_grid) * vertical_grid
+    
+    # Reconstruct snapped origin
+    snapped_origin = App.Vector(snapped_x, snapped_y, snapped_z)
+    
+    # Calculate adjustment
+    adjustment = snapped_origin - origin
+    adjustment_distance = adjustment.Length
+    
+    if adjustment_distance > 0.001:  # Only report if meaningful adjustment
+        print(f"  Grid snapping: adjusted origin by {adjustment_distance:.3f}mm")
+        print(f"    X: {origin_x:.3f} → {snapped_x:.3f} mm")
+        print(f"    Y: {origin_y:.3f} → {snapped_y:.3f} mm")
+        print(f"    Z: {origin_z:.3f} → {snapped_z:.3f} mm")
+    
+    return snapped_origin
+
+
+def find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold=0.0005):
+    """
+    Find vertical gaps in the outer wire that represent bay boundaries.
+    
+    This detects discontinuities in the wall face where bays are separated
+    by small gaps (typically fudgeFactor-sized, ~0.001mm) after fusing arrays.
+    
+    Args:
+        outer_wire: Face outer wire to analyze
+        u_vec: Horizontal axis direction vector
+        v_vec: Vertical axis direction vector  
+        gap_threshold: Minimum gap size to consider a boundary (mm)
+        
+    Returns:
+        List of positions along u_vec where boundaries are detected
+    """
+    # Determine which FreeCAD axis corresponds to our vertical direction
+    # v_vec should have Z component (vertical in FreeCAD)
+    angle_tolerance = 5.0  # degrees
+    
+    # Get all edges from the wire
+    vertical_edges = []
+    
+    for edge in outer_wire.Edges:
+        if edge.Length < 0.01:
+            continue
+        
+        try:
+            direction = edge.tangentAt(edge.FirstParameter)
+            direction.normalize()
+            
+            # Check if edge is parallel to v_vec (vertical)
+            dot_product = abs(direction.dot(v_vec))
+            angle = math.degrees(math.acos(min(1.0, dot_product)))
+            
+            # This is a vertical edge
+            if angle < angle_tolerance:
+                start = edge.valueAt(edge.FirstParameter)
+                end = edge.valueAt(edge.LastParameter)
+                
+                # Get position along u_vec (horizontal position)
+                u_pos = start.dot(u_vec)
+                
+                vertical_edges.append({
+                    'u_pos': u_pos,
+                    'edge': edge,
+                    'start': start,
+                    'end': end
+                })
+        except Exception as e:
+            continue
+    
+    if len(vertical_edges) < 2:
+        return []
+    
+    # Sort by horizontal position
+    vertical_edges.sort(key=lambda e: e['u_pos'])
+    
+    # Find gaps between adjacent vertical edges
+    bay_boundaries = []
+    
+    for i in range(len(vertical_edges) - 1):
+        u1 = vertical_edges[i]['u_pos']
+        u2 = vertical_edges[i + 1]['u_pos']
+        gap = u2 - u1
+        
+        # If gap is larger than threshold, this is a bay boundary
+        if gap > gap_threshold:
+            # Store the midpoint of the gap as the boundary
+            boundary_pos = (u1 + u2) / 2
+            bay_boundaries.append(boundary_pos)
+            print(f"  Found bay boundary at u={boundary_pos:.3f} (gap={gap:.4f}mm)")
+    
+    return bay_boundaries
+
+
+def create_brick_segments(u_length, bay_boundaries):
+    """
+    Create segments from bay boundaries.
+    
+    Args:
+        u_length: Total wall width
+        bay_boundaries: List of boundary positions
+        
+    Returns:
+        List of (start, end, width) tuples for each segment
+    """
+    segments = []
+    prev_boundary = 0.0
+    
+    for boundary in sorted(bay_boundaries):
+        if boundary > prev_boundary + 0.001:  # Skip tiny segments
+            width = boundary - prev_boundary
+            segments.append((prev_boundary, boundary, width))
+        prev_boundary = boundary
+    
+    # Add final segment
+    if prev_boundary < u_length - 0.001:
+        width = u_length - prev_boundary
+        segments.append((prev_boundary, u_length, width))
+    
+    # If no valid segments, use full width
+    if len(segments) == 0:
+        segments = [(0.0, u_length, u_length)]
+    
+    return segments
+
+
+def generate_segmented_bricks(u_length, v_length, brick_width, brick_height, brick_depth,
+                              mortar, bond_type, common_bond_count, bay_boundaries):
+    """
+    Generate bricks with optional bay segmentation.
+    
+    Returns:
+        Tuple of (brick_defs, metadata)
+    """
+    # Create segments if boundaries exist
+    segments = create_brick_segments(u_length, bay_boundaries)
+    print(f"Generating {len(segments)} segment(s)")
+    
+    all_brick_defs = []
+    total_metadata = {'num_courses': 0, 'bond_type': bond_type}
+    
+    for seg_idx, (seg_start, seg_end, seg_width) in enumerate(segments):
+        if len(segments) > 1:
+            print(f"  Segment {seg_idx + 1}: u={seg_start:.1f} to {seg_end:.1f} (width={seg_width:.1f}mm)")
+        
+        bg = BrickGeometry(
+            u_length=seg_width,
+            v_length=v_length,
+            brick_width=brick_width,
+            brick_height=brick_height,
+            brick_depth=brick_depth,
+            mortar=mortar,
+            bond_type=bond_type,
+            common_bond_count=common_bond_count
+        )
+        
+        result = bg.generate()
+        brick_defs = result['bricks']
+        metadata = result['metadata']
+        
+        # Offset brick positions by segment start
+        for brick_def in brick_defs:
+            # Create new BrickDef with offset u position
+            from brick_geometry import BrickDef
+            offset_brick = BrickDef(
+                index=len(all_brick_defs),
+                u=brick_def.u + seg_start,
+                v=brick_def.v,
+                course=brick_def.course,
+                brick_type=brick_def.brick_type,
+                width=brick_def.width,
+                height=brick_def.height,
+                depth=brick_def.depth
+            )
+            all_brick_defs.append(offset_brick)
+        
+        total_metadata['num_courses'] = max(total_metadata['num_courses'], 
+                                            metadata['num_courses'])
+    
+    return all_brick_defs, total_metadata
+
+
+def get_face_coordinate_system(face):
+    """
+    Establish a coordinate system for the face using bounding box analysis.
+    
+    Returns:
+        tuple: (origin, u_vec, v_vec, normal, u_length, v_length)
+    
+    Coordinate system:
+    - origin: lowest corner of bounding box
+    - u_vec: direction of largest extent (typically horizontal)
+    - v_vec: direction of vertical extent (must include Z component)
+    - normal: perpendicular to wall (from face)
+    """
+    
+    outer_wire = face.OuterWire
+    bbox = outer_wire.BoundBox
+    
+    # Origin at lowest corner
+    origin = App.Vector(bbox.XMin, bbox.YMin, bbox.ZMin)
+    
+    # Get all vertices to analyze axis ranges
+    vertices = outer_wire.Vertexes
+    points = [v.Point for v in vertices]
+    
+    x_vals = [p.x for p in points]
+    y_vals = [p.y for p in points]
+    z_vals = [p.z for p in points]
+    
+    x_min, x_max = min(x_vals), max(x_vals)
+    y_min, y_max = min(y_vals), max(y_vals)
+    z_min, z_max = min(z_vals), max(z_vals)
+    
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    z_range = z_max - z_min
+    
+    # Identify the three axes by their ranges
+    axes = [
+        (x_range, 'x', App.Vector(1, 0, 0)),
+        (y_range, 'y', App.Vector(0, 1, 0)),
+        (z_range, 'z', App.Vector(0, 0, 1))
+    ]
+    axes.sort(reverse=True)  # Sort by range, largest first
+    
+    # The vertical axis should have Z component (be the Z-axis or one of the others)
+    # Strategy: one of u/v should be Z, the other should be X or Y
+    
+    # Find which is the Z axis
+    z_axis = None
+    other_axes = []
+    for rng, name, vec in axes:
+        if name == 'z':
+            z_axis = (rng, name, vec)
+        else:
+            other_axes.append((rng, name, vec))
+    
+    # v_vec should be the Z axis (vertical)
+    # u_vec should be the largest of the remaining axes (horizontal)
+    if z_axis:
+        v_vec = z_axis[2]
+        v_length = z_axis[0]
+        
+        # u_vec is the largest non-Z axis
+        u_vec = other_axes[0][2]
+        u_length = other_axes[0][0]
+    else:
+        # No Z variation? Wall is horizontal (unusual). Use the two largest.
+        u_vec = axes[0][2]
+        u_length = axes[0][0]
+        v_vec = axes[1][2]
+        v_length = axes[1][0]
+    
+    # Get face normal
+    u_range = face.ParameterRange[:2]
+    v_range = face.ParameterRange[2:]
+    u_mid = (u_range[0] + u_range[1]) / 2
+    v_mid = (v_range[0] + v_range[1]) / 2
+    normal = face.normalAt(u_mid, v_mid)
+    
+    return origin, u_vec, v_vec, normal, u_length, v_length
+
+
+def scale_vector(vec, scale):
+    """Helper to scale a vector."""
+    return App.Vector(vec.x * scale, vec.y * scale, vec.z * scale)
+
+
+def create_brick_from_def(brick_def, origin, u_vec, v_vec, normal):
+    """
+    Create a FreeCAD brick solid from a brick definition.
+    
+    Constructs brick by building vertices in world space using wall coordinate vectors.
+    This ensures correct positioning and orientation without matrix transformations.
+    
+    Args:
+        brick_def: BrickDef with position, dimensions, and type
+        origin: Wall origin point
+        u_vec: Horizontal direction (left-right on wall, normalized)
+        v_vec: Vertical direction (up-down on wall, normalized)
+        normal: Wall normal (perpendicular out, normalized)
+        
+    Returns:
+        Part.Shape: Brick solid
+    """
+    
+    # Brick dimensions and position
+    u_pos = brick_def.u
+    v_pos = brick_def.v
+    width = brick_def.width
+    height = brick_def.height
+    depth = brick_def.depth
+    
+    # Build 8 vertices in world space
+    # Each vertex = origin + u_offset*u_vec + v_offset*v_vec + n_offset*normal
+    
+    # Near face (n=0)
+    p0 = origin + scale_vector(u_vec, u_pos) + scale_vector(v_vec, v_pos)
+    p1 = origin + scale_vector(u_vec, u_pos + width) + scale_vector(v_vec, v_pos)
+    p2 = origin + scale_vector(u_vec, u_pos + width) + scale_vector(v_vec, v_pos + height)
+    p3 = origin + scale_vector(u_vec, u_pos) + scale_vector(v_vec, v_pos + height)
+    
+    # Far face (n=depth)
+    p4 = p0 + scale_vector(normal, depth)
+    p5 = p1 + scale_vector(normal, depth)
+    p6 = p2 + scale_vector(normal, depth)
+    p7 = p3 + scale_vector(normal, depth)
+    
+    # Create the 12 edges
+    e0 = Part.Edge(Part.LineSegment(p0, p1).toShape())
+    e1 = Part.Edge(Part.LineSegment(p1, p2).toShape())
+    e2 = Part.Edge(Part.LineSegment(p2, p3).toShape())
+    e3 = Part.Edge(Part.LineSegment(p3, p0).toShape())
+    
+    e4 = Part.Edge(Part.LineSegment(p4, p5).toShape())
+    e5 = Part.Edge(Part.LineSegment(p5, p6).toShape())
+    e6 = Part.Edge(Part.LineSegment(p6, p7).toShape())
+    e7 = Part.Edge(Part.LineSegment(p7, p4).toShape())
+    
+    e8 = Part.Edge(Part.LineSegment(p0, p4).toShape())
+    e9 = Part.Edge(Part.LineSegment(p1, p5).toShape())
+    e10 = Part.Edge(Part.LineSegment(p2, p6).toShape())
+    e11 = Part.Edge(Part.LineSegment(p3, p7).toShape())
+    
+    # Create the 6 faces
+    wire_near = Part.Wire([e0, e1, e2, e3])
+    wire_far = Part.Wire([e4, e5, e6, e7])
+    wire_bottom = Part.Wire([e0, e9, e4, e8])
+    wire_top = Part.Wire([e2, e10, e6, e11])
+    wire_left = Part.Wire([e3, e8, e7, e11])
+    wire_right = Part.Wire([e1, e9, e5, e10])
+    
+    face_near = Part.Face(wire_near)
+    face_far = Part.Face(wire_far)
+    face_bottom = Part.Face(wire_bottom)
+    face_top = Part.Face(wire_top)
+    face_left = Part.Face(wire_left)
+    face_right = Part.Face(wire_right)
+    
+    # Create shell and solid
+    shell = Part.Shell([face_near, face_far, face_bottom, face_top, face_left, face_right])
+    brick = Part.Solid(shell)
+    
+    return brick
+
+
+def get_params_from_spreadsheet(doc):
+    """Try to read parameters from spreadsheet."""
+    params = {}
+    
+    try:
+        ss = doc.getObject("Spreadsheet")
+        if ss is None:
+            return None
+        
+        param_map = {
+            'brick_width': 'brickWidth',
+            'brick_height': 'brickHeight',
+            'brick_depth': 'brickDepth',
+            'mortar': 'mortar',
+            'bond_type': 'bondType',
+            'common_bond_count': 'commonBondCount'
+        }
+        
+        for param_key, cell_name in param_map.items():
+            try:
+                val = ss.get(cell_name)
+                if val is not None:
+                    if param_key in ['bond_type']:
+                        params[param_key] = str(val)
+                    else:
+                        params[param_key] = float(val)
+            except:
+                continue
+        
+        return params if params else None
+    except:
+        return None
+
+
+# ============================================================================
+# MACRO EXECUTION
+# ============================================================================
+
+if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins__':
+    doc = App.ActiveDocument
+    
+    if doc is None:
+        print("ERROR: No active document. Please create or open a document first.")
+    else:
+        # Get selection
+        selection = App.Gui.Selection.getSelectionEx()
+        
+        if not selection:
+            print("ERROR: Please select a sketch or face to apply bricks to.")
+        else:
+            sel_obj = selection[0].Object
+            obj_name = sel_obj.Label
+            
+            # Determine if this is a sketch or a face selection
+            is_sketch = (sel_obj.TypeId == 'Sketcher::SketchObject')
+            
+            if is_sketch:
+                # Sketch-based workflow
+                sketch = sel_obj
+                
+                print(f"\n{'='*60}")
+                print(f"Generating bricks for sketch: {obj_name}")
+                print(f"{'='*60}")
+                
+                try:
+                    # Get sketch outer wire (assumes sketch is closed)
+                    if not hasattr(sketch, 'Shape') or len(sketch.Shape.Wires) == 0:
+                        raise ValueError("Sketch has no valid wires")
+                    
+                    outer_wire = max(sketch.Shape.Wires, key=lambda w: abs(Part.Face(w).Area))
+                    face = Part.Face(outer_wire)
+                    
+                    # Get parameters first (needed for grid snapping)
+                    params = get_params_from_spreadsheet(doc)
+                    if params is None:
+                        params = {}
+                    
+                    # Fill in defaults
+                    brick_width = params.get('brick_width', 2.32)
+                    brick_height = params.get('brick_height', 0.65)
+                    brick_depth = params.get('brick_depth', 1.09)
+                    mortar = params.get('mortar', 0.11)
+                    bond_type = params.get('bond_type', 'stretcher')
+                    common_bond_count = int(params.get('common_bond_count', 5))
+                    
+                    # Get face coordinate system
+                    origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
+                    
+                    # Snap origin to global grid for course alignment
+                    origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar)
+                    
+                    # Detect bay boundaries
+                    print("Checking for bay boundaries...")
+                    gap_threshold = 0.0005  # Half of typical fudgeFactor
+                    bay_boundaries = find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold)
+                    
+                    if len(bay_boundaries) > 0:
+                        print(f"Found {len(bay_boundaries)} bay boundaries - will create segmented bricks")
+                    else:
+                        print("No bay boundaries detected - creating continuous brick wall")
+                    print()
+                    
+                    print(f"Wall dimensions: {u_length:.1f} x {v_length:.1f} mm")
+                    print(f"Brick: {brick_width} x {brick_height} x {brick_depth} mm")
+                    print(f"Mortar: {mortar} mm")
+                    print(f"Bond: {bond_type}")
+                    if bond_type.lower() == 'common':
+                        print(f"Common bond count: {common_bond_count}")
+                    print()
+                    
+                    # Generate geometry with segmentation
+                    print("Generating geometry...")
+                    brick_defs, metadata = generate_segmented_bricks(
+                        u_length, v_length, brick_width, brick_height, brick_depth,
+                        mortar, bond_type, common_bond_count, bay_boundaries
+                    )
+                    
+                    print(f"Generated {len(brick_defs)} brick definitions")
+                    print(f"Bond pattern: {metadata['bond_type']}")
+                    print(f"Number of courses: {metadata['num_courses']}")
+                    print()
+                    
+                    # Create FreeCAD objects
+                    print("Creating FreeCAD geometry...")
+                    brick_shapes = []
+                    print(f"DEBUG: origin={origin}")
+                    print(f"DEBUG: u_vec={u_vec}, v_vec={v_vec}, normal={normal}")
+                    for i, brick_def in enumerate(brick_defs):
+                        brick = create_brick_from_def(brick_def, origin, u_vec, v_vec, normal)
+                        brick_shapes.append(brick)
+                        
+                        if (i + 1) % 1000 == 0:
+                            print(f"  Created {i+1}/{len(brick_defs)} bricks...")
+                    
+                    print(f"Creating compound of {len(brick_shapes)} bricks...")
+                    result_shape = Part.Compound(brick_shapes)
+                    print(f"✓ Compound created (instant, no fusing)")
+                    
+                    # For object-based workflow, try to detect openings from main faces
+                    print("Checking for openings...")
+                    punchout_shapes = []
+                    try:
+                        # Try to get holes from the main faces
+                        for face in sel_obj.Shape.Faces:
+                            if len(face.Holes) > 0:
+                                punchout = detect_openings_and_create_punchout(
+                                    face, origin, u_vec, v_vec, normal, brick_depth
+                                )
+                                if punchout:
+                                    punchout_shapes.append(punchout)
+                    except Exception as e:
+                        print(f"  INFO: Could not detect holes from object faces: {e}")
+                    print()
+                    
+                    # Perform boolean cut if punchouts exist
+                    if punchout_shapes:
+                        print("Performing boolean cut operations...")
+                        try:
+                            for punchout in punchout_shapes:
+                                result_shape = result_shape.cut(punchout)
+                            
+                            if result_shape.isNull():
+                                print(f"WARNING: Cut operation returned null shape")
+                            else:
+                                print(f"✓ Cut completed - openings punched from bricks")
+                        except Exception as e:
+                            print(f"WARNING: Boolean cut failed: {e}")
+                            print(f"Continuing with unpunched bricks")
+                    print()
+                    
+                    # Create result object
+                    result_obj = doc.addObject("Part::Feature", f"BrickedWall_{obj_name}")
+                    result_obj.Shape = result_shape
+                    
+                    # Add metadata
+                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
+                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                    result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
+                    result_obj.addProperty("App::PropertyString", "BondType", "Metadata", "Bond pattern used")
+                    result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
+                    
+                    result_obj.GeneratorName = "brick_generator"
+                    result_obj.GeneratorVersion = "4.2.0"
+                    result_obj.SourceObject = obj_name
+                    result_obj.BondType = bond_type
+                    result_obj.BrickCount = len(brick_defs)
+                    
+                    doc.recompute()
+                    
+                    print(f"\n✓ Created: {result_obj.Label}")
+                    print(f"  Brick count: {len(brick_defs)}")
+                    print(f"  Bond type: {bond_type}")
+                    if punchout_shapes:
+                        print(f"  Openings: Punched and cut")
+                    print(f"\n{'='*60}")
+                    print("SUCCESS!")
+                    print(f"{'='*60}")
+                    
+                except Exception as e:
+                    print(f"\n{'='*60}")
+                    print(f"ERROR: {e}")
+                    print(f"{'='*60}")
+                    import traceback
+                    traceback.print_exc()
+            
+            elif selection[0].SubObjects:
+                # Face-based workflow - process all selected faces
+                sub_elements = selection[0].SubElementNames
+                
+                print(f"\n{'='*60}")
+                print(f"Generating bricks for: {obj_name}")
+                print(f"Selected: {len(sub_elements)} face(s)")
+                print(f"{'='*60}\n")
+                
+                # Get parameters once for all faces
+                params = get_params_from_spreadsheet(doc)
+                if params is None:
+                    params = {}
+                
+                # Fill in defaults
+                brick_width = params.get('brick_width', 2.32)
+                brick_height = params.get('brick_height', 0.65)
+                brick_depth = params.get('brick_depth', 1.09)
+                mortar = params.get('mortar', 0.11)
+                bond_type = params.get('bond_type', 'stretcher')
+                common_bond_count = int(params.get('common_bond_count', 5))
+                
+                # Collect all brick shapes from all faces
+                all_brick_shapes = []
+                total_brick_count = 0
+                faces_processed = []
+                
+                # Process each selected face
+                for face_num, sub_element in enumerate(sub_elements, 1):
+                    try:
+                        face_index = int(sub_element.replace('Face', '')) - 1
+                        face = sel_obj.Shape.Faces[face_index]
+                        
+                        print(f"\n--- Processing face {face_num}/{len(sub_elements)}: {sub_element} ---")
+                        
+                        # Get face coordinate system
+                        origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
+                        
+                        # Snap origin to global grid for course alignment
+                        origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar)
+                        
+                        # Detect bay boundaries
+                        print("Checking for bay boundaries...")
+                        gap_threshold = 0.0005  # Half of typical fudgeFactor
+                        outer_wire = face.OuterWire
+                        bay_boundaries = find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold)
+                        
+                        if len(bay_boundaries) > 0:
+                            print(f"  Found {len(bay_boundaries)} bay boundaries")
+                        else:
+                            print("  No bay boundaries detected")
+                        
+                        print(f"  Dimensions: {u_length:.1f} x {v_length:.1f} mm")
+                        
+                        # Generate geometry with segmentation
+                        brick_defs, metadata = generate_segmented_bricks(
+                            u_length, v_length, brick_width, brick_height, brick_depth,
+                            mortar, bond_type, common_bond_count, bay_boundaries
+                        )
+                        
+                        print(f"  Generated {len(brick_defs)} brick definitions")
+                        
+                        # Create FreeCAD brick shapes for this face
+                        face_brick_shapes = []
+                        for brick_def in brick_defs:
+                            brick = create_brick_from_def(brick_def, origin, u_vec, v_vec, normal)
+                            face_brick_shapes.append(brick)
+                        
+                        # Create compound for this face
+                        face_compound = Part.Compound(face_brick_shapes)
+                        
+                        # Detect openings in the face
+                        punchout_shape = detect_openings_and_create_punchout(
+                            face, origin, u_vec, v_vec, normal, brick_depth
+                        )
+                        
+                        # Perform boolean cut if punchouts exist
+                        if punchout_shape:
+                            print("  Cutting openings...")
+                            try:
+                                face_compound = face_compound.cut(punchout_shape)
+                                if not face_compound.isNull():
+                                    print(f"  ✓ Openings cut")
+                                else:
+                                    face_compound = Part.Compound(face_brick_shapes)
+                            except Exception as e:
+                                print(f"  WARNING: Opening cut failed: {e}")
+                                face_compound = Part.Compound(face_brick_shapes)
+                        
+                        # Trim bricks to face boundary
+                        print("  Trimming to boundary...")
+                        try:
+                            boundary_depth = 20.0  # mm
+                            boundary_vec = scale_vector(normal, boundary_depth * 2)
+                            boundary_start = scale_vector(normal, -boundary_depth)
+                            face_translated = face.translated(boundary_start)
+                            boundary_cutter = face_translated.extrude(boundary_vec)
+                            face_compound = face_compound.common(boundary_cutter)
+                            print(f"  ✓ Trimmed to boundary")
+                        except Exception as e:
+                            print(f"  WARNING: Boundary trimming failed: {e}")
+                        
+                        # Add this face's bricks to the collection
+                        all_brick_shapes.append(face_compound)
+                        total_brick_count += len(brick_defs)
+                        faces_processed.append(sub_element)
+                        
+                        print(f"  ✓ Face {sub_element} complete")
+                        
+                    except Exception as e:
+                        print(f"\n{'='*60}")
+                        print(f"ERROR processing {sub_element}: {e}")
+                        print(f"{'='*60}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                
+                # Create final compound of all faces
+                if all_brick_shapes:
+                    print(f"\n{'='*60}")
+                    print(f"Creating final compound from {len(faces_processed)} face(s)...")
+                    print(f"{'='*60}")
+                    
+                    try:
+                        if len(all_brick_shapes) == 1:
+                            final_shape = all_brick_shapes[0]
+                        else:
+                            final_shape = Part.Compound(all_brick_shapes)
+                        
+                        # Create result object
+                        result_obj = doc.addObject("Part::Feature", f"BrickedWall_{obj_name}")
+                        result_obj.Shape = final_shape
+                        
+                        # Add metadata
+                        result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
+                        result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                        result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
+                        result_obj.addProperty("App::PropertyString", "SourceFaces", "Metadata", "Source faces")
+                        result_obj.addProperty("App::PropertyString", "BondType", "Metadata", "Bond pattern used")
+                        result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
+                        
+                        result_obj.GeneratorName = "brick_generator"
+                        result_obj.GeneratorVersion = "4.2.0"
+                        result_obj.SourceObject = obj_name
+                        result_obj.SourceFaces = ", ".join(faces_processed)
+                        result_obj.BondType = bond_type
+                        result_obj.BrickCount = total_brick_count
+                        
+                        doc.recompute()
+                        
+                        print()
+                        print(f"✓ Created: {result_obj.Label}")
+                        print(f"  Total bricks: {total_brick_count}")
+                        print(f"  Faces processed: {len(faces_processed)}")
+                        print(f"  Bond type: {bond_type}")
+                        if punchout_shape:
+                            print(f"  Openings: Punched and cut")
+                        print()
+                        print(f"{'='*60}")
+                        print(f"SUCCESS!")
+                        print(f"{'='*60}")
+                        
+                    except Exception as e:
+                        print(f"\n{'='*60}")
+                        print(f"ERROR creating final compound: {e}")
+                        print(f"{'='*60}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print("\nERROR: No faces were successfully processed")
+            
+            else:
+                print("ERROR: Please select one or more faces to apply bricks to.")
+

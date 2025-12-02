@@ -1,0 +1,131 @@
+# Brick Generator CHANGELOG
+
+## v4.2.0 (2024-12-02)
+
+### Added
+- Global 3D grid snapping for brick course alignment across all faces
+- Origin snapping to (brick_width + mortar) grid in X/Y axes
+- Origin snapping to (brick_height + mortar) grid in Z axis
+- Automatic adjustment reporting shows grid snap distances
+
+### Fixed
+- **MAJOR**: Brick courses now align perfectly across coplanar faces
+- Eliminates visible seams at face boundaries
+- Courses maintain alignment even with multi-face selection
+- Works with both sketch-based and face-based workflows
+
+### Technical Details
+- `snap_origin_to_global_grid()` function snaps each face origin to global grid
+- Grid spacing: horizontal = brick_width + mortar, vertical = brick_height + mortar
+- Snapping rounds to nearest grid line in all three global axes (X, Y, Z)
+- Preserves per-face bay boundary detection and opening handling
+- All faces now share common brick course heights and column positions
+
+### Why This Matters
+When multiple faces are bricked independently (e.g., arrayed bays), each face previously had its own origin and generated bricks from scratch. This caused misaligned courses at face boundaries. Now all faces snap to a shared global grid, ensuring perfect alignment across the entire building.
+
+### Compatibility
+- Works with single and multi-face selection
+- Compatible with bay boundary detection
+- Works with sketch-based and face-based workflows
+- Requires FreeCAD 1.0.x with AI Copilot workbench
+
+## v4.1.0 (2024-12-02)
+
+### Added
+- Multi-face selection support: Ctrl+click to select multiple faces
+- Single compound output from multiple selected faces
+- Boundary trimming to prevent brick overflow beyond face edges
+- Per-face progress reporting during multi-face operations
+
+### Fixed
+- Opening detection now uses `face.Wires` instead of non-existent `face.Holes`
+- Wire filtering improved to use length comparison (more reliable)
+- Punchout extrusion simplified to generous 10mm depth
+- Deployment structure: macro in root, library in subdirectory (fixes FreeCAD UI visibility)
+
+### Changed
+- Simplified punchout depth calculation (10mm symmetric extrusion)
+- Improved error handling for individual face failures in multi-face mode
+- Version bumped to 4.1.0 to reflect multi-face feature addition
+
+### Technical Details
+- Multi-face workflow processes each face independently
+- Each face gets bay boundary detection, opening detection, and trimming
+- Final output is single compound containing all processed faces
+- Boundary trimming uses `common()` operation with extruded face volume
+- Wire filtering: sort by length, largest is outer boundary
+
+### Compatibility
+- Works with single face selection (backward compatible)
+- Works with multi-face selection (new feature)
+- Requires FreeCAD 1.0.x with AI Copilot workbench
+- Brick geometry library unchanged from v4.0.0
+
+## v4.0.0 (2024-12-02)
+
+### Added
+- Automatic opening (hole) detection from face geometry
+- Automatic punchout geometry generation from detected holes
+- Automatic boolean cut operation to punch holes in bricks
+- Support for any opening shape (rectangular, arched, complex)
+- Works seamlessly with arrayed walls containing holes
+
+### Changed
+- Generator now returns single output object with holes already punched
+- No separate punchout step required
+- Face.Holes detection integrated into main workflow
+- Opening detection and cutting happens automatically
+
+### Technical Details
+- Uses `face.Holes` property to detect openings
+- Extrudes each hole perpendicular to wall face
+- Performs boolean cut operation on brick compound
+- Graceful fallback if opening detection fails
+
+### Compatibility
+- Works with face-containing openings (drilled/subtracted holes)
+- Works with arrayed walls (holes come along with array)
+- Works with any opening shape or orientation
+- Fully backward compatible with walls without openings
+
+## v3.1.0 (2024-12-02)
+
+### Added
+- Bay boundary detection for fused array walls
+- Segmented brick generation for multi-bay structures
+- Support for arbitrary wall shapes with detected bay separations
+- Generator version reporting in FreeCAD object properties
+
+### Changed
+- Macro now automatically detects bay boundaries from wall geometry
+- Improved reporting with version information in metadata
+- Bay segmentation is automatic and transparent to user
+
+### Technical Details
+- `find_bay_boundaries()` detects vertical gaps in wall faces
+- `create_brick_segments()` partitions wall into independent bay sections
+- `generate_segmented_bricks()` generates bricks per-segment to avoid offset discontinuities
+- Gap detection threshold: 0.0005mm (half of standard fudgeFactor)
+
+### Compatibility
+- Works with both continuous walls and segmented bays
+- Compatible with FreeCAD 1.0.x with AI Copilot workbench
+- Brick geometry library remains unchanged from v3.0.0
+
+## v3.0.0 (2025-11-26)
+
+### Added
+- Initial release with parametric brick generation
+- Support for 4 bond patterns: Stretcher, English, Flemish, Common
+- Face-based and object-based workflows
+- Metadata properties on generated objects
+- Mortar joint simulation
+- Punchout method for openings (windows/doors)
+
+### Features
+- BrickGeometry pure Python library (no FreeCAD dependencies)
+- Configurable brick dimensions and mortar thickness
+- Common bond pattern with configurable stretcher-course count
+- Spreadsheet-based parameter management
+- Comprehensive error handling and reporting
