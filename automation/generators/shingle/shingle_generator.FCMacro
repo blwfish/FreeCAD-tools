@@ -1,11 +1,13 @@
 """
-Parametric Shingle Generator for FreeCAD v4.1.0
+Parametric Shingle Generator for FreeCAD v4.2.0
 Generates realistic shingles on roof surfaces from selected faces
 
 Author: Brian (with Claude assistance)
 Usage: Select one or more roof faces, run as macro in FreeCAD
 
 Version History:
+- 4.2.0: Feature: Support linked spreadsheets for multi-file projects.
+         Updated default parameters to newer HO scale values (3.5 × 2.0 mm).
 - 4.1.0: Performance: Use Part::Compound instead of fusing all shingles.
          Eliminates 2-minute+ batch fusion step. Fuse on-demand if Boolean
          operations needed. 55 tests passing.
@@ -54,26 +56,43 @@ except ImportError as e:
     print("Make sure shingle_geometry.py is in the _lib subdirectory of your Macro folder")
     sys.exit(1)
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 GENERATOR_NAME = "shingle_generator"
 
 
 def find_spreadsheet(doc, preferred_names):
     """
     Find spreadsheet by checking both object name and label.
+    Follows Links to find the actual Spreadsheet::Sheet object.
     """
     for ss_name in preferred_names:
         # Try by object name first
         obj = doc.getObject(ss_name)
-        if obj and obj.TypeId == 'Spreadsheet::Sheet':
-            print(f"Found spreadsheet by name: '{ss_name}'")
-            return obj
+        if obj:
+            # If it's a Link, follow it to the target
+            if obj.TypeId == 'App::Link':
+                target = obj.LinkedObject
+                if target and target.TypeId == 'Spreadsheet::Sheet':
+                    print(f"Found spreadsheet via link: '{ss_name}' → '{target.Name}'")
+                    return target
+            # If it's already a spreadsheet, use it
+            elif obj.TypeId == 'Spreadsheet::Sheet':
+                print(f"Found spreadsheet by name: '{ss_name}'")
+                return obj
         
         # Try by label
         for obj in doc.Objects:
-            if obj.TypeId == 'Spreadsheet::Sheet' and obj.Label == ss_name:
-                print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
-                return obj
+            if obj.Label == ss_name:
+                # If it's a Link, follow it
+                if obj.TypeId == 'App::Link':
+                    target = obj.LinkedObject
+                    if target and target.TypeId == 'Spreadsheet::Sheet':
+                        print(f"Found spreadsheet via link: '{ss_name}' → '{target.Name}' (object name: '{obj.Name}')")
+                        return target
+                # If it's already a spreadsheet, use it
+                elif obj.TypeId == 'Spreadsheet::Sheet':
+                    print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
+                    return obj
     
     return None
 
@@ -418,29 +437,29 @@ if __name__ == "__main__":
                 else:
                     print("Warning: Could not load parameters from spreadsheet, using defaults\n")
                     params = {
-                        'shingleWidth': 10.0,
-                        'shingleHeight': 20.0,
-                        'materialThickness': 0.5,
-                        'shingleExposure': 15.0,
+                        'shingleWidth': 3.5,
+                        'shingleHeight': 2.0,
+                        'materialThickness': 0.25,
+                        'shingleExposure': 1.5,
                         'shingleStaggerPattern': 'half'
                     }
             except Exception as e:
                 print(f"Warning: {e}")
                 print("Using default parameters\n")
                 params = {
-                    'shingleWidth': 10.0,
-                    'shingleHeight': 20.0,
-                    'materialThickness': 0.5,
-                    'shingleExposure': 15.0,
+                    'shingleWidth': 3.5,
+                    'shingleHeight': 2.0,
+                    'materialThickness': 0.25,
+                    'shingleExposure': 1.5,
                     'shingleStaggerPattern': 'half'
                 }
         else:
             print("No spreadsheet found, using default parameters:")
             params = {
-                'shingleWidth': 10.0,
-                'shingleHeight': 20.0,
-                'materialThickness': 0.5,
-                'shingleExposure': 15.0,
+                'shingleWidth': 3.5,
+                'shingleHeight': 2.0,
+                'materialThickness': 0.25,
+                'shingleExposure': 1.5,
                 'shingleStaggerPattern': 'half'
             }
             for key, val in params.items():

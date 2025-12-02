@@ -18,69 +18,99 @@ import sys
 import os
 
 # Try to import the geometry library
+# First try _lib/ subdirectory (standard installation location)
+# Then try same directory (fallback for manual installation)
 try:
     from brick_geometry import BrickGeometry
 except ImportError:
-    print("ERROR: Could not import brick_geometry module")
-    print("Make sure brick_geometry.py is in the same directory as this macro")
-    sys.exit(1)
+    # Try adding _lib to path
+    import sys
+    macro_dir = os.path.dirname(__file__)
+    lib_dir = os.path.join(macro_dir, '_lib')
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    
+    try:
+        from brick_geometry import BrickGeometry
+    except ImportError:
+        print("ERROR: Could not import brick_geometry module")
+        print(f"Looked in: {macro_dir}")
+        print(f"Looked in: {lib_dir}")
+        print("Make sure brick_geometry.py is in _lib/ subdirectory or same directory as macro")
+        sys.exit(1)
 
 
 def get_face_coordinate_system(face):
     """
-    Establish a coordinate system for the face.
+    Establish a coordinate system for the face using bounding box analysis.
     
     Returns:
         tuple: (origin, u_vec, v_vec, normal, u_length, v_length)
     
     Coordinate system:
-    - origin: lowest Z point on the outer wire
-    - u_vec: horizontal direction (left to right)
-    - v_vec: vertical direction (bottom to top)
-    - normal: perpendicular to wall (outward)
+    - origin: lowest corner of bounding box
+    - u_vec: direction of largest extent (typically horizontal)
+    - v_vec: direction of vertical extent (must include Z component)
+    - normal: perpendicular to wall (from face)
     """
     
-    # Get the outer boundary wire (ignores holes)
     outer_wire = face.OuterWire
+    bbox = outer_wire.BoundBox
     
-    # Find the lowest Z point as origin
+    # Origin at lowest corner
+    origin = App.Vector(bbox.XMin, bbox.YMin, bbox.ZMin)
+    
+    # Get all vertices to analyze axis ranges
     vertices = outer_wire.Vertexes
-    sorted_by_z = sorted(vertices, key=lambda v: v.Point.z)
-    origin = sorted_by_z[0].Point
+    points = [v.Point for v in vertices]
     
-    # Get edges from outer wire only
-    outer_edges = outer_wire.Edges
+    x_vals = [p.x for p in points]
+    y_vals = [p.y for p in points]
+    z_vals = [p.z for p in points]
     
-    # Find edges that share the origin vertex
-    origin_edges = []
-    for edge in outer_edges:
-        v1 = edge.Vertexes[0].Point
-        v2 = edge.Vertexes[1].Point
-        if v1.distanceToPoint(origin) < 0.001 or v2.distanceToPoint(origin) < 0.001:
-            origin_edges.append(edge)
+    x_min, x_max = min(x_vals), max(x_vals)
+    y_min, y_max = min(y_vals), max(y_vals)
+    z_min, z_max = min(z_vals), max(z_vals)
     
-    if len(origin_edges) < 2:
-        raise ValueError(f"Need at least 2 edges from origin, found {len(origin_edges)}")
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+    z_range = z_max - z_min
     
-    # Sort by length - U (width) is longer, V (height) is shorter
-    sorted_edges = sorted(origin_edges, key=lambda e: e.Length)
-    v_edge = sorted_edges[0]  # Shorter edge = height
-    u_edge = sorted_edges[1]  # Longer edge = width
+    # Identify the three axes by their ranges
+    axes = [
+        (x_range, 'x', App.Vector(1, 0, 0)),
+        (y_range, 'y', App.Vector(0, 1, 0)),
+        (z_range, 'z', App.Vector(0, 0, 1))
+    ]
+    axes.sort(reverse=True)  # Sort by range, largest first
     
-    # Get direction vectors
-    if u_edge.Vertexes[0].Point.distanceToPoint(origin) < 0.001:
-        u_vec = u_edge.Vertexes[1].Point.sub(u_edge.Vertexes[0].Point).normalize()
+    # The vertical axis should have Z component (be the Z-axis or one of the others)
+    # Strategy: one of u/v should be Z, the other should be X or Y
+    
+    # Find which is the Z axis
+    z_axis = None
+    other_axes = []
+    for rng, name, vec in axes:
+        if name == 'z':
+            z_axis = (rng, name, vec)
+        else:
+            other_axes.append((rng, name, vec))
+    
+    # v_vec should be the Z axis (vertical)
+    # u_vec should be the largest of the remaining axes (horizontal)
+    if z_axis:
+        v_vec = z_axis[2]
+        v_length = z_axis[0]
+        
+        # u_vec is the largest non-Z axis
+        u_vec = other_axes[0][2]
+        u_length = other_axes[0][0]
     else:
-        u_vec = u_edge.Vertexes[0].Point.sub(u_edge.Vertexes[1].Point).normalize()
-    
-    if v_edge.Vertexes[0].Point.distanceToPoint(origin) < 0.001:
-        v_vec = v_edge.Vertexes[1].Point.sub(v_edge.Vertexes[0].Point).normalize()
-    else:
-        v_vec = v_edge.Vertexes[0].Point.sub(v_edge.Vertexes[1].Point).normalize()
-    
-    # Ensure V vector points UP (positive Z)
-    if v_vec.z < 0:
-        v_vec = App.Vector(-v_vec.x, -v_vec.y, -v_vec.z)
+        # No Z variation? Wall is horizontal (unusual). Use the two largest.
+        u_vec = axes[0][2]
+        u_length = axes[0][0]
+        v_vec = axes[1][2]
+        v_length = axes[1][0]
     
     # Get face normal
     u_range = face.ParameterRange[:2]
@@ -88,10 +118,6 @@ def get_face_coordinate_system(face):
     u_mid = (u_range[0] + u_range[1]) / 2
     v_mid = (v_range[0] + v_range[1]) / 2
     normal = face.normalAt(u_mid, v_mid)
-    
-    # Get lengths from outer wire edges
-    u_length = u_edge.Length
-    v_length = v_edge.Length
     
     return origin, u_vec, v_vec, normal, u_length, v_length
 
@@ -105,32 +131,76 @@ def create_brick_from_def(brick_def, origin, u_vec, v_vec, normal):
     """
     Create a FreeCAD brick solid from a brick definition.
     
+    Constructs brick by building vertices in world space using wall coordinate vectors.
+    This ensures correct positioning and orientation without matrix transformations.
+    
     Args:
-        brick_def: BrickDef namedtuple with position, dimensions, and type
+        brick_def: BrickDef with position, dimensions, and type
         origin: Wall origin point
-        u_vec: Horizontal direction vector
-        v_vec: Vertical direction vector
-        normal: Wall normal vector
+        u_vec: Horizontal direction (left-right on wall, normalized)
+        v_vec: Vertical direction (up-down on wall, normalized)
+        normal: Wall normal (perpendicular out, normalized)
         
     Returns:
-        Part.Shape: Positioned and rotated brick solid
+        Part.Shape: Brick solid
     """
     
-    # Create the brick box
-    brick = Part.makeBox(brick_def.width, brick_def.height, brick_def.depth)
+    # Brick dimensions and position
+    u_pos = brick_def.u
+    v_pos = brick_def.v
+    width = brick_def.width
+    height = brick_def.height
+    depth = brick_def.depth
     
-    # Position in local 2D coordinates
-    position = origin + scale_vector(u_vec, brick_def.u) + scale_vector(v_vec, brick_def.v)
-    brick.translate(position)
+    # Build 8 vertices in world space
+    # Each vertex = origin + u_offset*u_vec + v_offset*v_vec + n_offset*normal
     
-    # Rotate to align with face
-    # This is the tricky part: align the brick's local coordinate system to the wall's
-    z_axis = App.Vector(0, 0, 1)
-    rot1 = App.Rotation(z_axis, normal)
-    x_after_rot1 = rot1.multVec(App.Vector(1, 0, 0))
-    rot2 = App.Rotation(x_after_rot1, u_vec)
-    combined_rotation = rot2.multiply(rot1)
-    brick.rotate(position, combined_rotation.Axis, math.degrees(combined_rotation.Angle))
+    # Near face (n=0)
+    p0 = origin + scale_vector(u_vec, u_pos) + scale_vector(v_vec, v_pos)
+    p1 = origin + scale_vector(u_vec, u_pos + width) + scale_vector(v_vec, v_pos)
+    p2 = origin + scale_vector(u_vec, u_pos + width) + scale_vector(v_vec, v_pos + height)
+    p3 = origin + scale_vector(u_vec, u_pos) + scale_vector(v_vec, v_pos + height)
+    
+    # Far face (n=depth)
+    p4 = p0 + scale_vector(normal, depth)
+    p5 = p1 + scale_vector(normal, depth)
+    p6 = p2 + scale_vector(normal, depth)
+    p7 = p3 + scale_vector(normal, depth)
+    
+    # Create the 12 edges
+    e0 = Part.Edge(Part.LineSegment(p0, p1).toShape())
+    e1 = Part.Edge(Part.LineSegment(p1, p2).toShape())
+    e2 = Part.Edge(Part.LineSegment(p2, p3).toShape())
+    e3 = Part.Edge(Part.LineSegment(p3, p0).toShape())
+    
+    e4 = Part.Edge(Part.LineSegment(p4, p5).toShape())
+    e5 = Part.Edge(Part.LineSegment(p5, p6).toShape())
+    e6 = Part.Edge(Part.LineSegment(p6, p7).toShape())
+    e7 = Part.Edge(Part.LineSegment(p7, p4).toShape())
+    
+    e8 = Part.Edge(Part.LineSegment(p0, p4).toShape())
+    e9 = Part.Edge(Part.LineSegment(p1, p5).toShape())
+    e10 = Part.Edge(Part.LineSegment(p2, p6).toShape())
+    e11 = Part.Edge(Part.LineSegment(p3, p7).toShape())
+    
+    # Create the 6 faces
+    wire_near = Part.Wire([e0, e1, e2, e3])
+    wire_far = Part.Wire([e4, e5, e6, e7])
+    wire_bottom = Part.Wire([e0, e9, e4, e8])
+    wire_top = Part.Wire([e2, e10, e6, e11])
+    wire_left = Part.Wire([e3, e8, e7, e11])
+    wire_right = Part.Wire([e1, e9, e5, e10])
+    
+    face_near = Part.Face(wire_near)
+    face_far = Part.Face(wire_far)
+    face_bottom = Part.Face(wire_bottom)
+    face_top = Part.Face(wire_top)
+    face_left = Part.Face(wire_left)
+    face_right = Part.Face(wire_right)
+    
+    # Create shell and solid
+    shell = Part.Shell([face_near, face_far, face_bottom, face_top, face_left, face_right])
+    brick = Part.Solid(shell)
     
     return brick
 
@@ -256,6 +326,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     # Create FreeCAD objects
                     print("Creating FreeCAD geometry...")
                     brick_shapes = []
+                    print(f"DEBUG: origin={origin}")
+                    print(f"DEBUG: u_vec={u_vec}, v_vec={v_vec}, normal={normal}")
                     for i, brick_def in enumerate(brick_defs):
                         brick = create_brick_from_def(brick_def, origin, u_vec, v_vec, normal)
                         brick_shapes.append(brick)
@@ -263,12 +335,9 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         if (i + 1) % 100 == 0:
                             print(f"  Created {i+1}/{len(brick_defs)} bricks...")
                     
-                    print(f"Fusing {len(brick_shapes)} bricks...")
-                    result_shape = brick_shapes[0]
-                    for i, brick in enumerate(brick_shapes[1:], 1):
-                        result_shape = result_shape.fuse(brick)
-                        if (i + 1) % 100 == 0:
-                            print(f"  Fused to {i+1} bricks...")
+                    print(f"Creating compound of {len(brick_shapes)} bricks...")
+                    result_shape = Part.Compound(brick_shapes)
+                    print(f"✓ Compound created (instant, no fusing)")
                     
                     # Create result object
                     result_obj = doc.addObject("Part::Feature", f"BrickedWall_{obj_name}")
@@ -318,6 +387,14 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     # Get face coordinate system
                     origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
                     
+                    print(f"DEBUG: Coordinate system detected:")
+                    print(f"  origin = {origin}")
+                    print(f"  u_vec = {u_vec}")
+                    print(f"  v_vec = {v_vec}")
+                    print(f"  normal = {normal}")
+                    print(f"  u_length = {u_length:.1f}, v_length = {v_length:.1f}")
+                    print()
+                    
                     # Get parameters
                     params = get_params_from_spreadsheet(doc)
                     if params is None:
@@ -364,6 +441,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     # Create FreeCAD objects
                     print("Creating FreeCAD geometry...")
                     brick_shapes = []
+                    print(f"DEBUG: origin={origin}")
+                    print(f"DEBUG: u_vec={u_vec}, v_vec={v_vec}, normal={normal}")
                     for i, brick_def in enumerate(brick_defs):
                         brick = create_brick_from_def(brick_def, origin, u_vec, v_vec, normal)
                         brick_shapes.append(brick)
@@ -371,12 +450,9 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         if (i + 1) % 100 == 0:
                             print(f"  Created {i+1}/{len(brick_defs)} bricks...")
                     
-                    print(f"Fusing {len(brick_shapes)} bricks...")
-                    result_shape = brick_shapes[0]
-                    for i, brick in enumerate(brick_shapes[1:], 1):
-                        result_shape = result_shape.fuse(brick)
-                        if (i + 1) % 100 == 0:
-                            print(f"  Fused to {i+1} bricks...")
+                    print(f"Creating compound of {len(brick_shapes)} bricks...")
+                    result_shape = Part.Compound(brick_shapes)
+                    print(f"✓ Compound created (instant, no fusing)")
                     
                     # Create result object
                     result_obj = doc.addObject("Part::Feature", f"BrickedWall_{obj_name}")
