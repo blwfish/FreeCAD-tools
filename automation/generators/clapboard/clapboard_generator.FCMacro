@@ -1,11 +1,14 @@
 """
-Parametric Clapboard Siding Generator for FreeCAD v5.3.0
+Parametric Clapboard Siding Generator for FreeCAD v5.4.0
 Generates realistic clapboard siding from explicitly selected FACES
 
 Author: Generated for model railroading (HO/O/N scale)
 Usage: Click on specific faces in the 3D view, then run this macro
 
 Version History:
+- 5.4.0: ADD: Bay boundary detection for fused arrays with vertical gaps
+         FIX: Clapboards now respect bay separations (fudgeFactor-sized gaps)
+         CHANGE: Segmented clapboard generation stops at detected boundaries
 - 5.3.0: CHANGE: SourceObject now uses App::PropertyLink (TNP-safe object reference)
          CHANGE: Stores actual object reference instead of label string
 - 5.2.0: CHANGE: Return skin-only geometry, use Part::Compound output
@@ -22,7 +25,7 @@ import Part
 from FreeCAD import Vector
 import math
 
-VERSION = "5.3.0"
+VERSION = "5.4.0"
 GENERATOR_NAME = "clapboard_generator"
 CLAPBOARD_TRIM_OFFSET = 0.05  # mm - Keep clapboard bottom slightly inboard of trim to avoid coplanar faces
 
@@ -269,103 +272,215 @@ def find_gable_edges(wire, vertical_axis='y', angle_tolerance=5.0):
     return gable_edges
 
 
+def find_bay_boundaries(outer_wire, horizontal_axis='x', vertical_axis='z', gap_threshold=0.0005):
+    """
+    Find vertical gaps in the outer wire that represent bay boundaries.
+    
+    Returns list of horizontal positions where bays are separated.
+    These are detected as discontinuities (gaps) in the vertical coverage.
+    """
+    # Get all vertical edges and their horizontal positions
+    if vertical_axis == 'z':
+        vert_dir = Vector(0, 0, 1)
+    else:
+        vert_dir = Vector(0, 1, 0)
+    
+    angle_tolerance = 5.0  # degrees from vertical
+    vertical_edges = []
+    
+    for edge in outer_wire.Edges:
+        if edge.Length < 0.01:
+            continue
+        
+        try:
+            direction = edge.tangentAt(edge.FirstParameter)
+            direction.normalize()
+            
+            dot_product = abs(direction.dot(vert_dir))
+            angle = math.degrees(math.acos(min(1.0, dot_product)))
+            
+            # This is a vertical edge
+            if angle < angle_tolerance:
+                start = edge.valueAt(edge.FirstParameter)
+                end = edge.valueAt(edge.LastParameter)
+                
+                # Get horizontal position
+                if horizontal_axis == 'x':
+                    h_pos = (start.x + end.x) / 2
+                else:
+                    h_pos = (start.y + end.y) / 2
+                
+                vertical_edges.append({
+                    'h_pos': h_pos,
+                    'edge': edge,
+                    'start': start,
+                    'end': end
+                })
+        except Exception as e:
+            continue
+    
+    if len(vertical_edges) < 2:
+        return []
+    
+    # Sort by horizontal position
+    vertical_edges.sort(key=lambda e: e['h_pos'])
+    
+    # Find gaps between adjacent vertical edges
+    bay_boundaries = []
+    
+    for i in range(len(vertical_edges) - 1):
+        h1 = vertical_edges[i]['h_pos']
+        h2 = vertical_edges[i + 1]['h_pos']
+        gap = h2 - h1
+        
+        # If gap is larger than threshold, this is a bay boundary
+        if gap > gap_threshold:
+            # Store the midpoint of the gap as the boundary
+            boundary_pos = (h1 + h2) / 2
+            bay_boundaries.append(boundary_pos)
+            print(f"  Found bay boundary at {horizontal_axis}={boundary_pos:.3f} (gap={gap:.4f}mm)")
+    
+    return bay_boundaries
+
+
 def create_clapboard_course_local(vert_position, bbox, clapboard_height, clapboard_thickness,
-                                  vertical_axis, horizontal_axis, normal):
-    """Create one horizontal clapboard course."""
+                                  vertical_axis, horizontal_axis, normal, bay_boundaries=None):
+    """Create one horizontal clapboard course, split at bay boundaries if provided."""
     actual_thick = clapboard_thickness - CLAPBOARD_TRIM_OFFSET
     thin_thickness = 0.01
     
-    if vertical_axis == 'z':
-        if horizontal_axis == 'x':
-            h_min, h_max = bbox.XMin - 0.1, bbox.XMax + 0.1
-            v_bottom, v_top = vert_position, vert_position + clapboard_height
-            v_max = bbox.ZMax + 0.1
-            
-            if v_top > v_max:
-                v_top = v_max
-            if v_bottom >= bbox.ZMax:
-                return None
-            
-            base_y = bbox.YMin
-            thick_offset = actual_thick if normal.y > 0 else -actual_thick
-            thin_offset = thin_thickness if normal.y > 0 else -thin_thickness
-            
-            outside_wire = Part.makePolygon([
-                Vector(h_min, base_y + thick_offset, v_bottom),
-                Vector(h_max, base_y + thick_offset, v_bottom),
-                Vector(h_max, base_y + thin_offset, v_top),
-                Vector(h_min, base_y + thin_offset, v_top),
-                Vector(h_min, base_y + thick_offset, v_bottom)
-            ])
-            inside_wire = Part.makePolygon([
-                Vector(h_min, base_y, v_bottom),
-                Vector(h_max, base_y, v_bottom),
-                Vector(h_max, base_y, v_top),
-                Vector(h_min, base_y, v_top),
-                Vector(h_min, base_y, v_bottom)
-            ])
-            clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
-            
-        else:
-            h_min, h_max = bbox.YMin - 0.1, bbox.YMax + 0.1
-            v_bottom, v_top = vert_position, vert_position + clapboard_height
-            v_max = bbox.ZMax + 0.1
-            
-            if v_top > v_max:
-                v_top = v_max
-            if v_bottom >= bbox.ZMax:
-                return None
-            
-            base_x = bbox.XMin
-            thick_offset = actual_thick if normal.x > 0 else -actual_thick
-            thin_offset = thin_thickness if normal.x > 0 else -thin_thickness
-            
-            outside_wire = Part.makePolygon([
-                Vector(base_x + thick_offset, h_min, v_bottom),
-                Vector(base_x + thick_offset, h_max, v_bottom),
-                Vector(base_x + thin_offset, h_max, v_top),
-                Vector(base_x + thin_offset, h_min, v_top),
-                Vector(base_x + thick_offset, h_min, v_bottom)
-            ])
-            inside_wire = Part.makePolygon([
-                Vector(base_x, h_min, v_bottom),
-                Vector(base_x, h_max, v_bottom),
-                Vector(base_x, h_max, v_top),
-                Vector(base_x, h_min, v_top),
-                Vector(base_x, h_min, v_bottom)
-            ])
-            clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
-    else:
-        h_min, h_max = bbox.XMin - 0.1, bbox.XMax + 0.1
-        v_bottom, v_top = vert_position, vert_position + clapboard_height
-        v_max = bbox.YMax + 0.1
-        
-        if v_top > v_max:
-            v_top = v_max
-        if v_bottom >= bbox.YMax:
-            return None
-        
-        base_z = 0
-        thick_offset = actual_thick if normal.z > 0 else -actual_thick
-        thin_offset = thin_thickness if normal.z > 0 else -thin_thickness
-        
-        outside_wire = Part.makePolygon([
-            Vector(h_min, v_bottom, base_z + thick_offset),
-            Vector(h_max, v_bottom, base_z + thick_offset),
-            Vector(h_max, v_top, base_z + thin_offset),
-            Vector(h_min, v_top, base_z + thin_offset),
-            Vector(h_min, v_bottom, base_z + thick_offset)
-        ])
-        inside_wire = Part.makePolygon([
-            Vector(h_min, v_bottom, base_z),
-            Vector(h_max, v_bottom, base_z),
-            Vector(h_max, v_top, base_z),
-            Vector(h_min, v_top, base_z),
-            Vector(h_min, v_bottom, base_z)
-        ])
-        clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+    # If no bay boundaries, create one continuous clapboard
+    if not bay_boundaries or len(bay_boundaries) == 0:
+        bay_boundaries = []
     
-    return clapboard_shape
+    # Get overall horizontal range
+    if horizontal_axis == 'x':
+        h_min_overall = bbox.XMin - 0.1
+        h_max_overall = bbox.XMax + 0.1
+    else:
+        h_min_overall = bbox.YMin - 0.1
+        h_max_overall = bbox.YMax + 0.1
+    
+    # Create segments between boundaries
+    segments = []
+    prev_boundary = h_min_overall
+    
+    for boundary in sorted(bay_boundaries):
+        if boundary > prev_boundary + 0.001:  # Skip tiny segments
+            segments.append((prev_boundary, boundary))
+        prev_boundary = boundary
+    
+    # Add final segment
+    if prev_boundary < h_max_overall - 0.001:
+        segments.append((prev_boundary, h_max_overall))
+    
+    # If no boundaries were valid, use full width
+    if len(segments) == 0:
+        segments = [(h_min_overall, h_max_overall)]
+    
+    # Create clapboard pieces for each segment
+    pieces = []
+    
+    for h_min, h_max in segments:
+        clapboard_shape = None
+        
+        if vertical_axis == 'z':
+            if horizontal_axis == 'x':
+                v_bottom, v_top = vert_position, vert_position + clapboard_height
+                v_max = bbox.ZMax + 0.1
+                
+                if v_top > v_max:
+                    v_top = v_max
+                if v_bottom >= bbox.ZMax:
+                    continue
+                
+                base_y = bbox.YMin
+                thick_offset = actual_thick if normal.y > 0 else -actual_thick
+                thin_offset = thin_thickness if normal.y > 0 else -thin_thickness
+                
+                outside_wire = Part.makePolygon([
+                    Vector(h_min, base_y + thick_offset, v_bottom),
+                    Vector(h_max, base_y + thick_offset, v_bottom),
+                    Vector(h_max, base_y + thin_offset, v_top),
+                    Vector(h_min, base_y + thin_offset, v_top),
+                    Vector(h_min, base_y + thick_offset, v_bottom)
+                ])
+                inside_wire = Part.makePolygon([
+                    Vector(h_min, base_y, v_bottom),
+                    Vector(h_max, base_y, v_bottom),
+                    Vector(h_max, base_y, v_top),
+                    Vector(h_min, base_y, v_top),
+                    Vector(h_min, base_y, v_bottom)
+                ])
+                clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+                
+            else:  # horizontal_axis == 'y'
+                v_bottom, v_top = vert_position, vert_position + clapboard_height
+                v_max = bbox.ZMax + 0.1
+                
+                if v_top > v_max:
+                    v_top = v_max
+                if v_bottom >= bbox.ZMax:
+                    continue
+                
+                base_x = bbox.XMin
+                thick_offset = actual_thick if normal.x > 0 else -actual_thick
+                thin_offset = thin_thickness if normal.x > 0 else -thin_thickness
+                
+                outside_wire = Part.makePolygon([
+                    Vector(base_x + thick_offset, h_min, v_bottom),
+                    Vector(base_x + thick_offset, h_max, v_bottom),
+                    Vector(base_x + thin_offset, h_max, v_top),
+                    Vector(base_x + thin_offset, h_min, v_top),
+                    Vector(base_x + thick_offset, h_min, v_bottom)
+                ])
+                inside_wire = Part.makePolygon([
+                    Vector(base_x, h_min, v_bottom),
+                    Vector(base_x, h_max, v_bottom),
+                    Vector(base_x, h_max, v_top),
+                    Vector(base_x, h_min, v_top),
+                    Vector(base_x, h_min, v_bottom)
+                ])
+                clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+        else:  # vertical_axis == 'y'
+            v_bottom, v_top = vert_position, vert_position + clapboard_height
+            v_max = bbox.YMax + 0.1
+            
+            if v_top > v_max:
+                v_top = v_max
+            if v_bottom >= bbox.YMax:
+                continue
+            
+            base_z = 0
+            thick_offset = actual_thick if normal.z > 0 else -actual_thick
+            thin_offset = thin_thickness if normal.z > 0 else -thin_thickness
+            
+            outside_wire = Part.makePolygon([
+                Vector(h_min, v_bottom, base_z + thick_offset),
+                Vector(h_max, v_bottom, base_z + thick_offset),
+                Vector(h_max, v_top, base_z + thin_offset),
+                Vector(h_min, v_top, base_z + thin_offset),
+                Vector(h_min, v_bottom, base_z + thick_offset)
+            ])
+            inside_wire = Part.makePolygon([
+                Vector(h_min, v_bottom, base_z),
+                Vector(h_max, v_bottom, base_z),
+                Vector(h_max, v_top, base_z),
+                Vector(h_min, v_top, base_z),
+                Vector(h_min, v_bottom, base_z)
+            ])
+            clapboard_shape = Part.makeLoft([inside_wire, outside_wire], True)
+        
+        if clapboard_shape:
+            pieces.append(clapboard_shape)
+    
+    # If we created multiple pieces, fuse them
+    if len(pieces) == 0:
+        return None
+    elif len(pieces) == 1:
+        return pieces[0]
+    else:
+        return pieces[0].fuse(pieces[1:])
 
 
 def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_thickness=0.2):
@@ -385,6 +500,16 @@ def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_t
     print(f"Face normal (local): ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
     
     parts = []
+    
+    # Detect bay boundaries from vertical gaps in the face
+    print("Checking for bay boundaries...")
+    gap_threshold = 0.0005  # Half of fudgeFactor (0.001mm)
+    bay_boundaries = find_bay_boundaries(outer_wire, horizontal_axis, vertical_axis, gap_threshold)
+    
+    if len(bay_boundaries) > 0:
+        print(f"Found {len(bay_boundaries)} bay boundaries - will create segmented clapboards")
+    else:
+        print("No bay boundaries detected - creating continuous clapboards")
     
     # Create clapboard courses
     print("Creating clapboard courses...")
@@ -406,7 +531,7 @@ def create_clapboard_wall(face, source_object, clapboard_height=0.8, clapboard_t
         try:
             clapboard = create_clapboard_course_local(
                 vert_pos, bbox, clapboard_height, clapboard_thickness,
-                vertical_axis, horizontal_axis, normal
+                vertical_axis, horizontal_axis, normal, bay_boundaries
             )
             if clapboard:
                 parts.append(clapboard)
