@@ -1,0 +1,166 @@
+# Brick Generator v4.0.0 Delivery Summary
+
+## Overview
+Brick generator with automatic opening detection and punchout. Generates fully finished bricked walls with holes punched for windows and doors.
+
+## Version
+- **Generator Version**: 4.0.0
+- **Release Date**: 2024-12-02
+- **Macro Filename**: `brick_generator_macro.FCMacro` (unversioned)
+- **Library Version**: brick_geometry.py v3.0.0 (unchanged)
+
+## What's New in v4.0.0
+- Automatic detection of openings (holes) in wall faces
+- Automatic punchout geometry generation
+- Automatic boolean cut operation
+- Result is fully finished wall with holes already punched
+- No separate punchout creation or manual cut operation needed
+- Works seamlessly with arrayed walls containing holes
+
+## Files Included
+
+### Core Files
+- `brick_generator_macro.FCMacro` - FreeCAD macro (unversioned filename)
+- `brick_geometry.py` - Pure Python geometry library (duplicate in root and _lib/)
+- `_lib/brick_geometry.py` - Library copy for macro import
+
+### Deployment & Installation
+- `git_populate.py` - Git-based deployment script
+- `freecad_installer.py` - Auto-generated FreeCAD macro installer
+- `README.md` - User documentation
+
+### Documentation
+- `CHANGELOG` - Version history and technical details
+- `DELIVERY_SUMMARY` - This file
+
+## Installation Methods
+
+### Method 1: Git Deployment (Recommended)
+```bash
+python3 git_populate.py
+```
+
+Installs to FreeCAD user macro directory:
+- Linux: `~/.config/FreeCAD/Macro/brick/`
+- macOS: `~/Library/Application Support/FreeCAD/Macro/brick/`
+- Windows: `%APPDATA%\FreeCAD\Macro\brick\`
+
+### Method 2: FreeCAD Macro Installation
+1. Open FreeCAD
+2. Tools → Macros → Execute macro
+3. Select `freecad_installer.py`
+4. Click Execute
+
+### Method 3: Manual Installation
+Copy to your FreeCAD macro directory:
+```
+FreeCAD/Macro/brick/
+├── brick_generator_macro.FCMacro
+├── brick_geometry.py
+└── _lib/
+    └── brick_geometry.py
+```
+
+## Usage
+
+### Object-Based Workflow
+1. Create a rectangular face or solid body in FreeCAD
+2. Select the object (not a face)
+3. Run `brick_generator_macro.FCMacro`
+4. Configure parameters in spreadsheet if needed
+5. Generator automatically detects bay boundaries
+
+### Face-Based Workflow
+1. Create geometry with the desired wall face
+2. Select the face
+3. Run `brick_generator_macro.FCMacro`
+4. Generator detects boundaries and creates segmented bricks
+
+## Parameters
+
+Configure via FreeCAD spreadsheet named `BrickParams`:
+- `brick_width` - Width of stretcher brick (mm) - Default: 2.32
+- `brick_height` - Height of brick (mm) - Default: 0.65
+- `brick_depth` - Depth of brick (mm) - Default: 1.09
+- `mortar` - Mortar joint thickness (mm) - Default: 0.11
+- `bond_type` - Bond pattern: 'stretcher', 'english', 'flemish', 'common' - Default: 'stretcher'
+- `common_bond_count` - For common bond: stretcher courses between headers - Default: 5
+
+## Bond Patterns
+
+### Stretcher (Running) Bond
+- Each course offset by half brick width
+- Most common pattern
+- Minimal material usage
+
+### English Bond
+- Alternating courses of stretchers and headers
+- Strong bond pattern
+- Historic pattern
+
+### Flemish Bond
+- Each course alternates stretchers and headers
+- Traditional decorative pattern
+- Strong diagonal strength
+
+### Common Bond
+- N stretcher courses followed by 1 header course
+- Configurable stretcher-course count
+- Balance of strength and economy
+
+## Output
+
+Generated object properties:
+- `GeneratorName` - "brick_generator"
+- `GeneratorVersion` - "3.1.0"
+- `SourceObject` - Name of source object
+- `SourceFace` - Selected face (if face-based workflow)
+- `BondType` - Bond pattern used
+- `BrickCount` - Number of bricks generated
+
+## Technical Notes
+
+### Bay Boundary Detection
+- Automatically detects vertical gaps in wall geometry
+- Threshold: 0.0005mm (half of standard fudgeFactor)
+- Handles fused array walls seamlessly
+- Reports boundary positions in console output
+
+### Segmented Generation
+- Wall is partitioned into independent bay sections
+- Each segment generates its own brick pattern
+- Prevents offset discontinuities at bay boundaries
+- Transparent to user - works like continuous wall
+
+### Coordinate System
+- U axis: Horizontal (left to right)
+- V axis: Vertical (bottom to top)
+- Normal: Perpendicular to wall surface
+
+### Performance
+- Compound generation (no fusing) - instant result
+- Typical 100-300 bricks per bay
+- Memory-efficient pure geometry approach
+
+## Known Limitations
+
+- **Openings**: Use "punchout" method - create geometry separately and cut from wall
+- **Shaped walls**: Currently optimized for rectangular walls; curved/angled walls may produce unexpected results
+- **Very small gaps**: Extremely small gaps (<0.0001mm) may not be detected
+
+## Compatibility
+
+- **FreeCAD**: 1.0.x (tested with AI Copilot workbench integration)
+- **Python**: 3.8+
+- **Platform**: Linux, macOS, Windows
+
+## Support & Feedback
+
+For issues or enhancements:
+1. Check console output for debug information
+2. Verify parameters in BrickParams spreadsheet
+3. Review CHANGELOG for version-specific notes
+
+## License
+
+This generator is part of the COVA (Chesapeake & Ohio Virginia) model railroad project.
