@@ -6,6 +6,19 @@ Author: Brian (with Claude assistance)
 Usage: Select one or more roof faces, run as macro in FreeCAD
 
 Version History:
+- 4.2.3: BUG FIX: Face extent calculation now projects all vertices onto U/V directions.
+         Previously used edge lengths from origin vertex, which on Boolean-cut faces
+         (hexagons, heptagons) only measured to adjacent vertices, not full face extent.
+         Result: Reported dimensions like 58.9x63.2mm for a 9702mm² face, causing severe
+         under-coverage. Now calculates actual face bounds along U/V axes.
+- 4.2.2: BUG FIX: Origin vertex selection now prefers corner vertices (2 edges meeting).
+         Previously used lowest Z vertex, which on Boolean-cut faces could be along
+         the cut edge rather than at a proper corner. This caused shingles to start
+         in the middle of faces (e.g., at dormer valleys) leaving gaps at actual edges.
+- 4.2.1: BUG FIX: Face orientation detection now uses Z-component instead of edge length.
+         Previously assumed longer edge = width, but this failed on faces where the
+         vertical dimension was longer than horizontal (e.g., narrow peaked roofs).
+         Now correctly identifies up-slope direction by Z-component change.
 - 4.2.0: Feature: Support linked spreadsheets for multi-file projects.
          Updated default parameters to newer HO scale values (3.5 × 2.0 mm).
 - 4.1.0: Performance: Use Part::Compound instead of fusing all shingles.
@@ -56,7 +69,7 @@ except ImportError as e:
     print("Make sure shingle_geometry.py is in the _lib subdirectory of your Macro folder")
     sys.exit(1)
 
-VERSION = "4.2.0"
+VERSION = "4.2.3"
 GENERATOR_NAME = "shingle_generator"
 
 
@@ -149,13 +162,33 @@ def get_face_coordinate_system(face):
             v_length: Length along V direction
     """
     
-    # Get vertices - find the LOWEST vertex (lowest Z) to start at the eave
+    # Get vertices - find a CORNER vertex at the lowest Z to start at the eave
+    # A corner vertex is one where exactly 2 edges meet (not 3+ which indicates a cut/intersection)
     vertices = face.Vertexes
-    sorted_by_z = sorted(vertices, key=lambda v: v.Point.z)
-    origin = sorted_by_z[0].Point
-    
-    # Get edges to determine U and V directions
     edges = face.Edges
+    
+    # Count edges meeting at each vertex
+    vertex_edge_count = {}
+    for vertex in vertices:
+        count = 0
+        for edge in edges:
+            v1 = edge.Vertexes[0].Point
+            v2 = edge.Vertexes[1].Point
+            if v1.distanceToPoint(vertex.Point) < 0.001 or v2.distanceToPoint(vertex.Point) < 0.001:
+                count += 1
+        vertex_edge_count[vertex] = count
+    
+    # Find corner vertices (exactly 2 edges meeting)
+    corner_vertices = [v for v in vertices if vertex_edge_count[v] == 2]
+    
+    # If we have corner vertices, use the lowest one
+    # Otherwise fall back to lowest vertex overall
+    if corner_vertices:
+        sorted_corners = sorted(corner_vertices, key=lambda v: v.Point.z)
+        origin = sorted_corners[0].Point
+    else:
+        sorted_by_z = sorted(vertices, key=lambda v: v.Point.z)
+        origin = sorted_by_z[0].Point
     
     # Find edges that share the origin vertex
     origin_edges = []
@@ -168,12 +201,23 @@ def get_face_coordinate_system(face):
     if len(origin_edges) < 2:
         raise ValueError(f"Need at least 2 edges from origin, found {len(origin_edges)}")
     
-    # Sort by length - for roofing:
-    # - U (width) should go across the roof (longer edge)
-    # - V (height) should go up the slope (shorter edge)
-    sorted_edges = sorted(origin_edges, key=lambda e: e.Length)
-    v_edge = sorted_edges[0]  # Shorter edge = up the slope (V/height)
-    u_edge = sorted_edges[1]  # Longer edge = across roof (U/width)
+    # Determine which edge goes up the slope vs across:
+    # - V (height) should go up the slope (larger Z component)
+    # - U (width) should go across the roof (smaller Z component)
+    
+    # Get direction vectors for both edges from origin
+    edge_dirs = []
+    for edge in origin_edges[:2]:  # Only need first 2
+        if edge.Vertexes[0].Point.distanceToPoint(origin) < 0.001:
+            direction = edge.Vertexes[1].Point.sub(edge.Vertexes[0].Point)
+        else:
+            direction = edge.Vertexes[0].Point.sub(edge.Vertexes[1].Point)
+        edge_dirs.append((edge, abs(direction.z)))
+    
+    # Sort by Z component - edge with larger Z change goes up slope (V)
+    sorted_by_z = sorted(edge_dirs, key=lambda x: x[1])
+    u_edge = sorted_by_z[0][0]  # Smaller Z = across roof (U/width)
+    v_edge = sorted_by_z[1][0]  # Larger Z = up the slope (V/height)
     
     # Get direction vectors from origin along the two edges
     if u_edge.Vertexes[0].Point.distanceToPoint(origin) < 0.001:
@@ -193,9 +237,23 @@ def get_face_coordinate_system(face):
     # Get normal from face
     normal = face.normalAt(0.5, 0.5).normalize()
     
-    # Get edge lengths
-    u_length = u_edge.Length
-    v_length = v_edge.Length
+    # Calculate face extents by projecting all vertices onto U and V directions
+    # This handles complex faces (hexagons, heptagons) from Boolean cuts correctly
+    u_projections = []
+    v_projections = []
+    
+    for vertex in face.Vertexes:
+        # Vector from origin to this vertex
+        vec_to_vertex = vertex.Point.sub(origin)
+        # Project onto U and V directions
+        u_proj = vec_to_vertex.dot(u_vec)
+        v_proj = vec_to_vertex.dot(v_vec)
+        u_projections.append(u_proj)
+        v_projections.append(v_proj)
+    
+    # Face extents are the range of projections
+    u_length = max(u_projections) - min(u_projections)
+    v_length = max(v_projections) - min(v_projections)
     
     return origin, u_vec, v_vec, normal, u_length, v_length
 
