@@ -1,0 +1,320 @@
+"""
+Parametric Station Sign Generator for FreeCAD v1.1.1
+Generates C&O style station signs with parametric text and borders
+
+Author: Brian (with Claude assistance)
+Usage: Create an object (box, sketch, etc), set its Label to the station name,
+       select it, then run this macro
+
+Version History:
+- 1.0.0: Initial release. Generates signs from station name, scales text width,
+         creates raised border frame and text on background slab.
+- 1.1.0: Fixed border gap (now visible space between border and text),
+         improved text centering, cleaned up ShapeString properly,
+         changed input method to use selected object's Label property
+- 1.1.1: Increased default border gap to match photo reference (equal to border
+         thickness), ensured ShapeString is properly hidden before removal
+
+Requirements: FreeCAD 0.20 or later, Python 3.8+
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+import math
+import sys
+import os
+
+# Import Draft for text creation
+try:
+    import Draft
+except ImportError:
+    print("ERROR: Draft workbench not available")
+    sys.exit(1)
+
+VERSION = "1.1.1"
+GENERATOR_NAME = "station_sign_generator"
+
+
+def get_parameters_from_spreadsheet(doc):
+    """
+    Try to find and extract parameters from a linked Skeleton spreadsheet.
+    Falls back to defaults if not found.
+    """
+    defaults = {
+        'materialThickness': 0.2,      # mm (0.2mm for 3D printing)
+        'borderThickness': 0.5,        # mm (constant, from prototype photo ~1/9 of letter height)
+        'borderGap': 1.0,              # mm (gap between border and text - approximately 2x border thickness per photo)
+    }
+    
+    # Try to find Skeleton spreadsheet
+    skeleton_names = ['Skeleton', 'Parameters', 'params']
+    for ss_name in skeleton_names:
+        ss = doc.getObject(ss_name)
+        if ss and ss.TypeId == 'Spreadsheet::Sheet':
+            try:
+                # Try to read values - these are typical cell locations
+                cell_mappings = {
+                    'materialThickness': 'B2',
+                    'borderThickness': 'B3',
+                    'borderGap': 'B4',
+                }
+                
+                for param_name, cell_ref in cell_mappings.items():
+                    try:
+                        cell_value = ss.get(cell_ref)
+                        if cell_value is not None:
+                            defaults[param_name] = float(cell_value)
+                    except:
+                        pass  # Use default if cell not found or not numeric
+                
+                print(f"Loaded parameters from spreadsheet '{ss_name}'")
+                return defaults
+            except Exception as e:
+                print(f"Could not read from spreadsheet: {e}")
+    
+    print("Using default parameters (no Skeleton spreadsheet found)")
+    return defaults
+
+
+def get_station_name_from_selection():
+    """
+    Get station name from the Label property of the selected object.
+    Returns station name string or None if no selection or invalid.
+    """
+    selection = Gui.Selection.getSelection()
+    
+    if not selection:
+        print("ERROR: No object selected. Please select an object whose Label contains the station name.")
+        return None
+    
+    if len(selection) > 1:
+        print("WARNING: Multiple objects selected. Using first one.")
+    
+    obj = selection[0]
+    station_name = obj.Label.strip()
+    
+    if not station_name:
+        print("ERROR: Selected object has empty Label. Please set Label to station name.")
+        return None
+    
+    print(f"Using station name from selected object: '{station_name}'")
+    return station_name
+
+
+def generate_station_sign(doc, station_name, params):
+    """
+    Generate a complete station sign object.
+    
+    Args:
+        doc: FreeCAD document
+        station_name: String name for the station (e.g., "Gordonsville")
+        params: Dictionary with materialThickness, borderThickness, borderGap
+    
+    Returns:
+        Part object representing the sign
+    """
+    
+    # Text properties
+    text_height_full_scale = 16.0  # inches (specification)
+    mm_per_inch = 25.4
+    text_height_ho = (text_height_full_scale / 87.0) * mm_per_inch  # Convert to HO (mm)
+    
+    print(f"\n=== Station Sign Generator v{VERSION} ===")
+    print(f"Station name: {station_name}")
+    print(f"Text height (HO): {text_height_ho:.3f} mm")
+    print(f"Material thickness: {params['materialThickness']} mm")
+    print(f"Border thickness: {params['borderThickness']} mm")
+    print(f"Border gap: {params['borderGap']} mm")
+    
+    # Create a ShapeString object (text as actual geometry)
+    font_path = os.path.expanduser("~/Documents/FreeCAD-github/Station-font-AV-20-219.ttf")
+    
+    if os.path.exists(font_path):
+        print(f"Using font: {font_path}")
+        text_obj = Draft.make_shapestring(station_name, font_path, Size=text_height_ho)
+    else:
+        print(f"Font file not found at {font_path}, using default system font")
+        # Use system default font (empty string for fontpath)
+        text_obj = Draft.make_shapestring(station_name, "", Size=text_height_ho)
+    
+    doc.recompute()
+    
+    # Get actual bounding box from the ShapeString geometry
+    try:
+        bb = text_obj.Shape.BoundBox
+        text_width = bb.XLength
+        text_height_dim = bb.YLength
+        print(f"Text shape dimensions: {text_width:.3f} x {text_height_dim:.3f} mm")
+    except Exception as e:
+        print(f"Error getting text bounding box: {e}")
+        # Safe fallback estimate
+        text_width = len(station_name) * text_height_ho * 0.55
+        text_height_dim = text_height_ho
+        print(f"Using fallback dimensions: {text_width:.3f} x {text_height_dim:.3f} mm")
+    
+    # Calculate sign dimensions
+    # Structure: [border][gap][text][gap][border]
+    border_thick = params['borderThickness']
+    gap = params['borderGap']
+    mat_thick = params['materialThickness']
+    
+    # Total sign size: border + gap + text + gap + border
+    sign_width = (2 * border_thick) + (2 * gap) + text_width
+    sign_height = (2 * border_thick) + (2 * gap) + text_height_dim
+    
+    print(f"Sign dimensions: {sign_width:.3f} x {sign_height:.3f} mm")
+    
+    # Z-heights
+    bg_thickness = 2 * mat_thick  # Background slab thickness
+    border_height = bg_thickness + mat_thick  # Border sits on top of background
+    text_height = border_height + mat_thick   # Text sits on top of border
+    
+    # Create background slab
+    bg = Part.makeBox(sign_width, sign_height, bg_thickness)
+    bg_obj = doc.addObject("Part::Feature", f"SignBackground_{station_name}")
+    bg_obj.Shape = bg
+    
+    # Create border frame
+    # Outer rectangle matches sign dimensions
+    # Inner rectangle is inset by border_thick to create the frame
+    outer_x = 0
+    outer_y = 0
+    outer_w = sign_width
+    outer_h = sign_height
+    
+    inner_x = border_thick
+    inner_y = border_thick
+    inner_w = sign_width - (2 * border_thick)
+    inner_h = sign_height - (2 * border_thick)
+    
+    # Create border as box with hole cut out
+    border_frame = Part.makeBox(outer_w, outer_h, mat_thick,
+                                Vector(outer_x, outer_y, bg_thickness))
+    border_hole = Part.makeBox(inner_w, inner_h, mat_thick,
+                               Vector(inner_x, inner_y, bg_thickness))
+    border = border_frame.cut(border_hole)
+    
+    border_obj = doc.addObject("Part::Feature", f"SignBorder_{station_name}")
+    border_obj.Shape = border
+    
+    # Text positioning: centered within the gap area
+    # The gap area is the inner rectangle (inside the border)
+    # Center the text within this area
+    available_width = inner_w
+    available_height = inner_h
+    
+    # Center text in the available space (which already has the gap built in)
+    text_x = inner_x + (available_width - text_width) / 2
+    text_y = inner_y + (available_height - text_height_dim) / 2
+    text_z = border_height
+    
+    print(f"Text position: ({text_x:.3f}, {text_y:.3f}, {text_z:.3f})")
+    print(f"Available space for text: {available_width:.3f} x {available_height:.3f} mm")
+    print(f"Gap between border and text: {gap:.3f} mm (on all sides)")
+    
+    # Extrude the text shape for 3D printing
+    text_shape = text_obj.Shape
+    print(f"Text shape type: {text_shape.ShapeType}")
+    print(f"Text shape has {len(text_shape.Edges)} edges, {len(text_shape.Faces)} faces")
+    
+    # Extrude the entire compound at once to preserve topology
+    try:
+        text_extrude = text_shape.extrude(Vector(0, 0, mat_thick))
+        print(f"Extruded text shape: {text_extrude.ShapeType}")
+    except Exception as e:
+        print(f"Error extruding text: {e}")
+        # Fallback: create a simple box as placeholder
+        text_extrude = Part.makeBox(text_width, text_height_dim, mat_thick)
+        print(f"Using fallback box geometry due to error")
+    
+    # Move the extruded text to the correct position
+    text_extrude.translate(Vector(text_x, text_y, text_z))
+    
+    text_geom_obj = doc.addObject("Part::Feature", f"SignText_{station_name}")
+    text_geom_obj.Shape = text_extrude
+    
+    # Fuse all parts into a single solid for 3D printing
+    try:
+        fused = bg_obj.Shape.fuse(border_obj.Shape)
+        fused = fused.fuse(text_geom_obj.Shape)
+        print(f"Fused successfully: {fused.ShapeType}")
+    except Exception as e:
+        print(f"Error during fuse: {e}")
+        # Fallback to compound if fuse fails
+        fused = Part.makeCompound([bg_obj.Shape, border_obj.Shape, text_geom_obj.Shape])
+        print(f"Fuse failed, using compound instead")
+    
+    sign_obj = doc.addObject("Part::Feature", f"StationSign_{station_name}")
+    sign_obj.Shape = fused
+    
+    # Add metadata properties
+    sign_obj.addProperty("App::PropertyString", "GeneratorName", "Generator")
+    sign_obj.GeneratorName = GENERATOR_NAME
+    
+    sign_obj.addProperty("App::PropertyString", "GeneratorVersion", "Generator")
+    sign_obj.GeneratorVersion = VERSION
+    
+    sign_obj.addProperty("App::PropertyString", "StationName", "Parameters")
+    sign_obj.StationName = station_name
+    
+    sign_obj.addProperty("App::PropertyFloat", "TextHeightHO", "Parameters")
+    sign_obj.TextHeightHO = text_height_ho
+    
+    sign_obj.addProperty("App::PropertyFloat", "SignWidth", "Parameters")
+    sign_obj.SignWidth = sign_width
+    
+    sign_obj.addProperty("App::PropertyFloat", "SignHeight", "Parameters")
+    sign_obj.SignHeight = sign_height
+    
+    sign_obj.addProperty("App::PropertyFloat", "BorderThickness", "Parameters")
+    sign_obj.BorderThickness = border_thick
+    
+    sign_obj.addProperty("App::PropertyFloat", "BorderGap", "Parameters")
+    sign_obj.BorderGap = gap
+    
+    # Clean up intermediate objects from the tree
+    doc.removeObject(bg_obj.Name)
+    doc.removeObject(border_obj.Name)
+    doc.removeObject(text_geom_obj.Name)
+    
+    # Hide ShapeString before removing to avoid display issues
+    text_obj.ViewObject.Visibility = False
+    doc.recompute()
+    doc.removeObject(text_obj.Name)
+    
+    print(f"✅ Station sign '{station_name}' generated successfully!")
+    print(f"   Object name: {sign_obj.Name}")
+    
+    return sign_obj
+
+
+def main():
+    """Main entry point for the macro."""
+    doc = App.activeDocument()
+    
+    if not doc:
+        print("ERROR: No active document. Please create or open a document first.")
+        return
+    
+    # Get station name from selected object's Label
+    station_name = get_station_name_from_selection()
+    if not station_name:
+        return
+    
+    # Get parameters
+    params = get_parameters_from_spreadsheet(doc)
+    
+    # Generate sign
+    try:
+        sign = generate_station_sign(doc, station_name, params)
+        doc.recompute()
+    except Exception as e:
+        print(f"\n❌ Error generating sign: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
