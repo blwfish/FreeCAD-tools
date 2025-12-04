@@ -1,0 +1,19 @@
+*.FCStd
+*.FCbak
+*.FCStd1
+*.dxf
+.DS_Store
+.AppleDoble
+.LSOveride
+*.swp
+*~
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-*
