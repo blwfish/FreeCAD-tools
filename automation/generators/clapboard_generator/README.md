@@ -1,16 +1,18 @@
-# Clapboard Generator v5.2.0
+# Clapboard Generator v6.0.0
 
 **Parametric Clapboard Siding Generator for FreeCAD**
 
-This package contains the clapboard generator macro (v5.2.0) with critical bug fix: duplicate wall geometry elimination through Part::Compound output structure.
+This package contains the clapboard generator macro (v6.0.0) with global grid snapping for perfect clapboard alignment across multiple faces.
 
-## What's New in v5.2.0
+## What's New in v6.0.0
 
-**Major Fix:** Eliminated duplicate wall geometry in clapboard output.
+**Major Feature:** Global grid snapping for perfect clapboard alignment across faces.
 
-- **Before**: Output contained fused geometry (wall + skin), duplicating wall
-- **After**: Output is a Part::Compound referencing both wall and skin separately
-- **Benefit**: Cleaner exports, proper separation, smart trim integration ready
+- **Before**: Each face generated clapboards independently, causing misaligned courses at boundaries
+- **After**: All faces snap to shared global vertical grid for perfect alignment
+- **Benefit**: No visible seams at face boundaries, professional appearance across entire building
+
+See CHANGELOG.md for complete version history including v5.2.0 (compound output fix).
 
 ## Installation
 
@@ -52,13 +54,15 @@ git tag -a v5.2.0 -m "clapboard_generator v5.2.0"
 ## File Structure
 
 ```
-clapboard-generator-v5.2.0/
-├── clapboard_generator.FCMacro ........... FreeCAD macro (v5.2.0)
+clapboard_generator/
+├── clapboard_generator.FCMacro ........... FreeCAD macro (v6.0.0)
 ├── clapboard_geometry.py ................ Pure Python geometry library
 ├── clapboard_freecad_installer.py ....... Automated FreeCAD installer
 ├── clapboard_git_populate.py ............ Git repository organizer
+├── CHANGELOG.md ......................... Complete version history
 ├── README.md ............................ This file
-└── [documentation files from outputs]
+└── tests/
+    └── test_clapboard_geometry.py ....... Automated test suite
 ```
 
 ## Usage in FreeCAD
@@ -104,7 +108,27 @@ Parameters are read from spreadsheet (default: "params" or "Spreadsheet"):
 
 ## Testing
 
-See `CLAPBOARD_TEST_CHECKLIST.md` for comprehensive testing guide:
+### Automated Test Suite
+
+The geometry library includes comprehensive automated tests:
+
+```bash
+cd tests
+python3 -m pytest test_clapboard_geometry.py -v
+```
+
+Tests cover:
+- Clapboard geometry generation
+- Parameter validation
+- Edge cases and boundary conditions
+- Grid snapping logic
+- Course alignment verification
+
+All tests are pure Python and run without FreeCAD.
+
+### Manual Testing
+
+See `CLAPBOARD_TEST_CHECKLIST.md` for comprehensive manual testing guide:
 
 1. Install macro
 2. Select wall face
@@ -198,30 +222,37 @@ Same as FreeCAD (LGPL)
 ## Version Info
 
 ```
-Clapboard Generator v5.2.0
-Date: 2025-11-30
-Status: Ready for testing and deployment
-Risk Level: Low (focused architecture fix)
+Clapboard Generator v6.0.0
+Date: 2024-12-02
+Status: Production ready
+Features: Global grid snapping, multi-face alignment
 Backward Compatible: Yes
-TNP-Safe: Partial (object references by Label, fix pending)
+TNP-Safe: Partial (object references use App::PropertyLink)
+Tests: Comprehensive automated test suite included
 ```
 
 ## Files in This Package
 
 | File | Purpose | Status |
 |------|---------|--------|
-| clapboard_generator.FCMacro | Main macro (v5.2.0) | ✅ Updated |
-| clapboard_geometry.py | Geometry library (v5.1.0) | ✅ Included |
+| clapboard_generator.FCMacro | Main macro (v6.0.0) | ✅ Updated |
+| clapboard_geometry.py | Geometry library | ✅ Included |
 | clapboard_freecad_installer.py | Auto FreeCAD installer | ✅ Provided |
 | clapboard_git_populate.py | Git repository organizer | ✅ Provided |
+| tests/test_clapboard_geometry.py | Automated test suite | ✅ Included |
+| CHANGELOG.md | Complete version history | ✅ Current |
 | README.md | This file | ✅ Current |
 
-## Next Release (Planned)
+## Version History Summary
 
-**v5.3.0** (after TNP property fix):
-- Change `SourceObject` to App::PropertyLink
-- Handle backward compatibility
-- Better metadata preservation
+- **v6.0.0** - Global grid snapping for multi-face alignment (current)
+- **v5.4.0** - Bay boundary detection for fused arrays
+- **v5.3.0** - TNP-safe App::PropertyLink for source objects
+- **v5.2.0** - Part::Compound output, eliminated duplicate wall geometry
+- **v5.1.0** - Removed trim logic (deferred to smart_trim)
+- **v5.0.0** - Face-based selection rewrite
+
+See CHANGELOG.md for complete details.
 
 ---
 
