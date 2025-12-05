@@ -28,4 +28,4 @@ jobs:
     
     - name: Run tests
       run: |
-        pytest automation/tests/ -v
+        pytest automation/tests/ automation/generators/*/tests/ -v --ignore-glob="**/*/tests/__pycache__"
