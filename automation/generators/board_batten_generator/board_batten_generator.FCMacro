@@ -1,0 +1,614 @@
+"""
+Parametric Board-and-Batten Siding Generator for FreeCAD v1.0.0
+Generates realistic board-and-batten siding from explicitly selected FACES
+
+Author: Generated for model railroading (HO/O/N scale)
+Usage: Click on specific faces in the 3D view, then run this macro
+
+Version History:
+- 1.0.0: Initial release - vertical board-and-batten siding generator
+         Based on clapboard_generator v6.0.0 architecture
+         Supports face-based selection, spreadsheet parameters, gable trimming
+"""
+
+import FreeCAD as App
+import Part
+from FreeCAD import Vector
+import math
+
+VERSION = "1.0.0"
+GENERATOR_NAME = "board_batten_generator"
+
+# Default parameters for HO scale
+DEFAULT_BOARD_WIDTH = 7.0      # mm - width of each vertical board
+DEFAULT_BATTEN_WIDTH = 0.6     # mm - width of batten strips
+DEFAULT_BOARD_THICKNESS = 0.2  # mm - thickness of board material
+DEFAULT_BATTEN_PROJECTION = 0.12  # mm - how far battens project from boards
+
+
+def find_spreadsheet(doc, preferred_names):
+    """Find spreadsheet by checking both object name and label."""
+    for ss_name in preferred_names:
+        obj = doc.getObject(ss_name)
+        if obj and obj.TypeId == 'Spreadsheet::Sheet':
+            print(f"Found spreadsheet by name: '{ss_name}'")
+            return obj
+
+        for obj in doc.Objects:
+            if obj.TypeId == 'Spreadsheet::Sheet' and obj.Label == ss_name:
+                print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
+                return obj
+
+    return None
+
+
+def get_params_from_spreadsheet(doc):
+    """Try to read board-and-batten parameters from spreadsheet."""
+    preferred_names = ["params", "BoardBattenParameters", "BuildingParameters", "Spreadsheet"]
+
+    ss = find_spreadsheet(doc, preferred_names)
+    if ss is None:
+        return None
+
+    params = {}
+    param_map = {
+        'board_width': ['board_width', 'BoardWidth', 'boardWidth'],
+        'batten_width': ['batten_width', 'BattenWidth', 'battenWidth'],
+        'board_thickness': ['board_thickness', 'BoardThickness', 'thickness', 'materialThickness'],
+        'batten_projection': ['batten_projection', 'BattenProjection', 'battenProjection'],
+    }
+
+    for param_key, possible_names in param_map.items():
+        for name in possible_names:
+            try:
+                val = ss.get(name)
+                if val is not None:
+                    params[param_key] = float(val)
+                    break
+            except:
+                continue
+
+    return params if params else None
+
+
+def check_for_degenerate_edges(wire):
+    """Detect edges with zero or near-zero length."""
+    degenerate = []
+    tolerance = 0.001  # mm
+
+    for i, edge in enumerate(wire.Edges):
+        if edge.Length < tolerance:
+            degenerate.append((i, edge.Length))
+
+    return degenerate
+
+
+def check_for_duplicate_edges(wire):
+    """Detect duplicate or overlapping edges in a wire."""
+    edges = wire.Edges
+    duplicates = []
+    tolerance = 0.001  # mm
+
+    for i in range(len(edges)):
+        for j in range(i + 1, len(edges)):
+            edge1 = edges[i]
+            edge2 = edges[j]
+
+            e1_start = edge1.valueAt(edge1.FirstParameter)
+            e1_end = edge1.valueAt(edge1.LastParameter)
+            e2_start = edge2.valueAt(edge2.FirstParameter)
+            e2_end = edge2.valueAt(edge2.LastParameter)
+
+            if (e1_start.distanceToPoint(e2_start) < tolerance and
+                e1_end.distanceToPoint(e2_end) < tolerance):
+                duplicates.append((i, j))
+            elif (e1_start.distanceToPoint(e2_end) < tolerance and
+                  e1_end.distanceToPoint(e2_start) < tolerance):
+                duplicates.append((i, j))
+
+    return duplicates
+
+
+def validate_wire_geometry(wire, wire_name="Wire"):
+    """Validate wire for common geometry errors."""
+    degenerate = check_for_degenerate_edges(wire)
+    if degenerate:
+        errors = [f"  Edge {i}: length={length:.6f}mm" for i, length in degenerate]
+        raise ValueError(
+            f"{wire_name} has {len(degenerate)} degenerate edge(s):\n" +
+            "\n".join(errors) +
+            "\nThese are likely duplicate/overlapping lines in your sketch.\n" +
+            "Check for stray geometry in the Sketcher!"
+        )
+
+    duplicates = check_for_duplicate_edges(wire)
+    if duplicates:
+        errors = [f"  Edges {i} and {j}" for i, j in duplicates]
+        raise ValueError(
+            f"{wire_name} has {len(duplicates)} duplicate edge(s):\n" +
+            "\n".join(errors) +
+            "\nThese are overlapping lines in your sketch.\n" +
+            "Check for stray geometry in the Sketcher!"
+        )
+
+
+def get_selected_faces():
+    """Get explicitly selected faces from FreeCAD selection."""
+    import FreeCADGui
+
+    faces_list = []
+    selection_ex = FreeCADGui.Selection.getSelectionEx()
+
+    if len(selection_ex) == 0:
+        raise ValueError("No objects selected!")
+
+    for sel_obj in selection_ex:
+        obj = sel_obj.Object
+
+        if not hasattr(obj, 'Shape'):
+            print(f"Warning: '{obj.Label}' has no Shape property")
+            continue
+
+        if len(sel_obj.SubElementNames) > 0:
+            for sub_name in sel_obj.SubElementNames:
+                if sub_name.startswith('Face'):
+                    try:
+                        face_num = int(sub_name[4:]) - 1
+
+                        if face_num < len(obj.Shape.Faces):
+                            face = obj.Shape.Faces[face_num]
+                            faces_list.append((obj, face, face_num))
+                            print(f"  Selected: {sub_name} from '{obj.Label}'")
+                        else:
+                            print(f"Warning: Face index {face_num} out of range for '{obj.Label}'")
+                    except ValueError:
+                        print(f"Warning: Could not parse face number from '{sub_name}'")
+        else:
+            raise ValueError(
+                f"Please select specific FACES, not the whole object!\n"
+                f"Click in the 3D view to select '{obj.Label}',\n"
+                f"then Ctrl+click on the specific faces you want board-and-batten on."
+            )
+
+    if len(faces_list) == 0:
+        raise ValueError("No faces explicitly selected! Please Ctrl+click on the faces you want.")
+
+    return faces_list
+
+
+def get_face_wires(face):
+    """Get wires from a face (outer boundary and holes)."""
+    wires = face.Wires
+
+    if len(wires) == 0:
+        raise ValueError("Face has no wires!")
+
+    outer_wire = max(wires, key=lambda w: abs(Part.Face(w).Area))
+    hole_wires = [w for w in wires if w != outer_wire]
+
+    if not outer_wire.isClosed():
+        raise ValueError("Outer wire is not closed! Cannot generate board-and-batten.")
+
+    for i, hw in enumerate(hole_wires):
+        if not hw.isClosed():
+            raise ValueError(f"Hole wire {i} is not closed!")
+
+    validate_wire_geometry(outer_wire, "Outer wire")
+
+    for i, hw in enumerate(hole_wires):
+        validate_wire_geometry(hw, f"Hole wire {i}")
+
+    return outer_wire, hole_wires
+
+
+def get_face_bounding_box_local(face):
+    """Get bounding box of a face in its local coordinates."""
+    return face.BoundBox
+
+
+def get_face_normal(face):
+    """Get the normal vector of a face at its center."""
+    u_range = face.ParameterRange[:2]
+    v_range = face.ParameterRange[2:]
+    u_mid = (u_range[0] + u_range[1]) / 2
+    v_mid = (v_range[0] + v_range[1]) / 2
+    normal = face.normalAt(u_mid, v_mid)
+    return normal
+
+
+def detect_face_orientation(bbox):
+    """Detect which plane a face lies in based on bounding box extents."""
+    x_extent = bbox.XMax - bbox.XMin
+    y_extent = bbox.YMax - bbox.YMin
+    z_extent = bbox.ZMax - bbox.ZMin
+
+    tolerance = 0.1
+
+    if x_extent < tolerance:
+        return 'z', 'y', 'x'
+    elif y_extent < tolerance:
+        return 'z', 'x', 'y'
+    elif z_extent < tolerance:
+        return 'y', 'x', 'z'
+    else:
+        if z_extent >= y_extent and z_extent >= x_extent:
+            if x_extent > y_extent:
+                return 'z', 'x', 'y'
+            else:
+                return 'z', 'y', 'x'
+        else:
+            return 'y', 'x', 'z'
+
+
+def create_board(h_start, h_end, bbox, board_thickness, vertical_axis, horizontal_axis, normal):
+    """Create a single vertical board."""
+    # Get vertical range
+    if vertical_axis == 'z':
+        v_min = bbox.ZMin - 0.1
+        v_max = bbox.ZMax + 0.1
+    else:
+        v_min = bbox.YMin - 0.1
+        v_max = bbox.YMax + 0.1
+
+    # Create board shape based on orientation
+    if vertical_axis == 'z':
+        if horizontal_axis == 'x':
+            # YZ plane, boards run in Z direction
+            base_y = bbox.YMin
+            offset = board_thickness if normal.y > 0 else -board_thickness
+
+            wire = Part.makePolygon([
+                Vector(h_start, base_y, v_min),
+                Vector(h_end, base_y, v_min),
+                Vector(h_end, base_y, v_max),
+                Vector(h_start, base_y, v_max),
+                Vector(h_start, base_y, v_min)
+            ])
+            board = Part.Face(wire).extrude(Vector(0, offset, 0))
+
+        else:  # horizontal_axis == 'y'
+            # XZ plane, boards run in Z direction
+            base_x = bbox.XMin
+            offset = board_thickness if normal.x > 0 else -board_thickness
+
+            wire = Part.makePolygon([
+                Vector(base_x, h_start, v_min),
+                Vector(base_x, h_end, v_min),
+                Vector(base_x, h_end, v_max),
+                Vector(base_x, h_start, v_max),
+                Vector(base_x, h_start, v_min)
+            ])
+            board = Part.Face(wire).extrude(Vector(offset, 0, 0))
+
+    else:  # vertical_axis == 'y'
+        # XY plane, boards run in Y direction
+        base_z = 0
+        offset = board_thickness if normal.z > 0 else -board_thickness
+
+        wire = Part.makePolygon([
+            Vector(h_start, v_min, base_z),
+            Vector(h_end, v_min, base_z),
+            Vector(h_end, v_max, base_z),
+            Vector(h_start, v_max, base_z),
+            Vector(h_start, v_min, base_z)
+        ])
+        board = Part.Face(wire).extrude(Vector(0, 0, offset))
+
+    return board
+
+
+def create_batten(h_center, batten_width, bbox, board_thickness, batten_projection,
+                  vertical_axis, horizontal_axis, normal):
+    """Create a single batten strip at a board seam."""
+    # Get vertical range
+    if vertical_axis == 'z':
+        v_min = bbox.ZMin - 0.1
+        v_max = bbox.ZMax + 0.1
+    else:
+        v_min = bbox.YMin - 0.1
+        v_max = bbox.YMax + 0.1
+
+    # Batten sits on top of boards
+    h_start = h_center - batten_width / 2
+    h_end = h_center + batten_width / 2
+    total_thickness = board_thickness + batten_projection
+
+    # Create batten shape based on orientation
+    if vertical_axis == 'z':
+        if horizontal_axis == 'x':
+            # YZ plane
+            base_y = bbox.YMin
+            offset = total_thickness if normal.y > 0 else -total_thickness
+
+            wire = Part.makePolygon([
+                Vector(h_start, base_y, v_min),
+                Vector(h_end, base_y, v_min),
+                Vector(h_end, base_y, v_max),
+                Vector(h_start, base_y, v_max),
+                Vector(h_start, base_y, v_min)
+            ])
+            batten = Part.Face(wire).extrude(Vector(0, offset, 0))
+
+        else:  # horizontal_axis == 'y'
+            # XZ plane
+            base_x = bbox.XMin
+            offset = total_thickness if normal.x > 0 else -total_thickness
+
+            wire = Part.makePolygon([
+                Vector(base_x, h_start, v_min),
+                Vector(base_x, h_end, v_min),
+                Vector(base_x, h_end, v_max),
+                Vector(base_x, h_start, v_max),
+                Vector(base_x, h_start, v_min)
+            ])
+            batten = Part.Face(wire).extrude(Vector(offset, 0, 0))
+
+    else:  # vertical_axis == 'y'
+        # XY plane
+        base_z = 0
+        offset = total_thickness if normal.z > 0 else -total_thickness
+
+        wire = Part.makePolygon([
+            Vector(h_start, v_min, base_z),
+            Vector(h_end, v_min, base_z),
+            Vector(h_end, v_max, base_z),
+            Vector(h_start, v_max, base_z),
+            Vector(h_start, v_min, base_z)
+        ])
+        batten = Part.Face(wire).extrude(Vector(0, 0, offset))
+
+    return batten
+
+
+def create_board_and_batten_wall(face, source_object, board_width=DEFAULT_BOARD_WIDTH,
+                                  batten_width=DEFAULT_BATTEN_WIDTH,
+                                  board_thickness=DEFAULT_BOARD_THICKNESS,
+                                  batten_projection=DEFAULT_BATTEN_PROJECTION):
+    """Generate board-and-batten siding from a face."""
+    print(f"\nGenerating board-and-batten for face from '{source_object.Label}' (v{VERSION})...")
+
+    outer_wire, hole_wires = get_face_wires(face)
+
+    bbox = get_face_bounding_box_local(face)
+    print(f"Face bounds: X=[{bbox.XMin:.1f}, {bbox.XMax:.1f}], "
+          f"Y=[{bbox.YMin:.1f}, {bbox.YMax:.1f}], Z=[{bbox.ZMin:.1f}, {bbox.ZMax:.1f}]")
+
+    vertical_axis, horizontal_axis, plane_normal = detect_face_orientation(bbox)
+    print(f"Orientation: vertical={vertical_axis}, horizontal={horizontal_axis}")
+
+    normal = get_face_normal(face)
+    print(f"Face normal (local): ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
+
+    # Get horizontal extent
+    if horizontal_axis == 'x':
+        h_min = bbox.XMin - 0.1
+        h_max = bbox.XMax + 0.1
+    else:
+        h_min = bbox.YMin - 0.1
+        h_max = bbox.YMax + 0.1
+
+    wall_width = h_max - h_min
+    num_boards = int(math.ceil(wall_width / board_width))
+    print(f"Width: {wall_width:.2f}mm = {num_boards} boards @ {board_width}mm each")
+
+    # Create boards
+    print("Creating boards...")
+    boards = []
+    for i in range(num_boards):
+        h_start = h_min + i * board_width
+        h_end = h_start + board_width
+
+        try:
+            board = create_board(h_start, h_end, bbox, board_thickness,
+                               vertical_axis, horizontal_axis, normal)
+            boards.append(board)
+        except Exception as e:
+            print(f"Warning: Board {i} failed: {e}")
+
+    print(f"Created {len(boards)}/{num_boards} boards")
+
+    if len(boards) == 0:
+        raise RuntimeError("No boards created!")
+
+    # Create battens at seams
+    print("Creating battens...")
+    battens = []
+    for i in range(num_boards - 1):
+        h_seam = h_min + (i + 1) * board_width
+
+        try:
+            batten = create_batten(h_seam, batten_width, bbox, board_thickness,
+                                 batten_projection, vertical_axis, horizontal_axis, normal)
+            battens.append(batten)
+        except Exception as e:
+            print(f"Warning: Batten {i} failed: {e}")
+
+    print(f"Created {len(battens)}/{num_boards - 1} battens")
+
+    # Fuse all boards together
+    print("Fusing boards...")
+    if len(boards) == 1:
+        fused_boards = boards[0]
+    else:
+        fused_boards = boards[0].fuse(boards[1:])
+
+    # Fuse all battens together
+    if len(battens) > 0:
+        print("Fusing battens...")
+        if len(battens) == 1:
+            fused_battens = battens[0]
+        else:
+            fused_battens = battens[0].fuse(battens[1:])
+
+        # Combine boards and battens
+        print("Combining boards and battens...")
+        combined = fused_boards.fuse(fused_battens)
+    else:
+        combined = fused_boards
+
+    print(f"Combined volume: {combined.Volume:.2f} mm³")
+
+    # Trim to face boundary (handles gable edges)
+    print("Trimming to face boundary...")
+    try:
+        # Extrude face in both directions to create cutting volume
+        face_cutter_fwd = face.extrude(normal * (board_thickness + batten_projection + 1.0))
+        face_cutter_back = face.extrude(normal * -(board_thickness + 1.0))
+        face_cutter = face_cutter_fwd.fuse(face_cutter_back)
+
+        trimmed = combined.common(face_cutter)
+        print(f"Trimmed volume: {trimmed.Volume:.2f} mm³")
+        combined = trimmed
+    except Exception as e:
+        print(f"Warning: Face trimming failed: {e}")
+
+    # Cut holes
+    print(f"Cutting {len(hole_wires)} holes...")
+    final_siding = combined
+
+    holes_cut = 0
+    for i, hole_wire in enumerate(hole_wires):
+        try:
+            hole_face = Part.Face(hole_wire)
+            hole_volume_fwd = hole_face.extrude(normal * (board_thickness + batten_projection + 1.0))
+            hole_volume_back = hole_face.extrude(normal * -(board_thickness + 1.0))
+            hole_volume = hole_volume_fwd.fuse(hole_volume_back)
+
+            volume_before = final_siding.Volume
+            final_siding = final_siding.cut(hole_volume)
+            volume_after = final_siding.Volume
+
+            if volume_before - volume_after > 0.001:
+                holes_cut += 1
+                print(f"  Hole {i}: OK")
+        except Exception as e:
+            print(f"  Warning: Hole {i} failed: {e}")
+
+    print(f"Cut {holes_cut}/{len(hole_wires)} holes")
+
+    print(f"\nBoard-and-batten siding complete")
+    print(f"Final volume: {final_siding.Volume:.2f} mm³")
+    return final_siding
+
+
+# Main execution
+if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins__':
+    doc = App.activeDocument()
+    if doc is None:
+        App.Console.PrintError("No active document!\n")
+    else:
+        try:
+            faces_list = get_selected_faces()
+        except ValueError as e:
+            App.Console.PrintError(f"Error: {e}\n")
+            faces_list = []
+
+        if len(faces_list) == 0:
+            App.Console.PrintError("No faces selected!\n")
+        else:
+            params = get_params_from_spreadsheet(doc)
+
+            if params:
+                App.Console.PrintMessage("Using parameters from spreadsheet\n")
+                board_width = params.get('board_width', DEFAULT_BOARD_WIDTH)
+                batten_width = params.get('batten_width', DEFAULT_BATTEN_WIDTH)
+                board_thickness = params.get('board_thickness', DEFAULT_BOARD_THICKNESS)
+                batten_projection = params.get('batten_projection', DEFAULT_BATTEN_PROJECTION)
+            else:
+                App.Console.PrintMessage("Using HO scale defaults\n")
+                board_width = DEFAULT_BOARD_WIDTH
+                batten_width = DEFAULT_BATTEN_WIDTH
+                board_thickness = DEFAULT_BOARD_THICKNESS
+                batten_projection = DEFAULT_BATTEN_PROJECTION
+
+            if len(faces_list) > 1:
+                App.Console.PrintMessage(f"\n=== Processing {len(faces_list)} faces ===\n")
+
+            # Collect all siding from all faces
+            all_siding = []
+            faces_processed = []
+            source_objects = set()
+
+            # Process each selected face
+            for face_num, (source_obj, face, face_idx) in enumerate(faces_list, 1):
+                try:
+                    App.Console.PrintMessage(f"\n--- Processing face {face_num}/{len(faces_list)}: Face{face_idx + 1} from '{source_obj.Label}' ---\n")
+
+                    siding = create_board_and_batten_wall(
+                        face, source_obj, board_width, batten_width,
+                        board_thickness, batten_projection
+                    )
+
+                    # Add this face's siding to the collection
+                    all_siding.append(siding)
+                    faces_processed.append(f"Face{face_idx + 1}")
+                    source_objects.add(source_obj)
+
+                    App.Console.PrintMessage(f"  ✓ Face{face_idx + 1} complete\n")
+
+                except Exception as e:
+                    App.Console.PrintError(f"  ✗ Face{face_idx + 1} from '{source_obj.Label}': {e}\n")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+            # Create final compound of all faces
+            if all_siding:
+                App.Console.PrintMessage(f"\n{'='*60}\n")
+                App.Console.PrintMessage(f"Creating final compound from {len(faces_processed)} face(s)...\n")
+                App.Console.PrintMessage(f"{'='*60}\n")
+
+                try:
+                    # Create single compound shape
+                    if len(all_siding) == 1:
+                        final_shape = all_siding[0]
+                    else:
+                        final_shape = Part.Compound(all_siding)
+
+                    # Determine output name
+                    if len(source_objects) == 1:
+                        obj_name = list(source_objects)[0].Label
+                    else:
+                        obj_name = "MultipleObjects"
+
+                    # Create result object
+                    result_obj = doc.addObject("Part::Feature", f"BoardBattenWall_{obj_name}")
+                    result_obj.Shape = final_shape
+
+                    # Add metadata
+                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
+                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                    result_obj.addProperty("App::PropertyString", "SourceFaces", "Metadata", "Source faces")
+                    result_obj.addProperty("App::PropertyFloat", "BoardWidth", "Metadata", "Board width")
+                    result_obj.addProperty("App::PropertyFloat", "BattenWidth", "Metadata", "Batten width")
+                    result_obj.addProperty("App::PropertyFloat", "BoardThickness", "Metadata", "Board thickness")
+                    result_obj.addProperty("App::PropertyFloat", "BattenProjection", "Metadata", "Batten projection")
+
+                    result_obj.GeneratorName = GENERATOR_NAME
+                    result_obj.GeneratorVersion = VERSION
+                    result_obj.SourceFaces = ", ".join(faces_processed)
+                    result_obj.BoardWidth = board_width
+                    result_obj.BattenWidth = batten_width
+                    result_obj.BoardThickness = board_thickness
+                    result_obj.BattenProjection = batten_projection
+
+                    doc.recompute()
+
+                    App.Console.PrintMessage(f"\n✓ Created: {result_obj.Label}\n")
+                    App.Console.PrintMessage(f"  Faces processed: {len(faces_processed)}\n")
+                    App.Console.PrintMessage(f"  Board width: {board_width}mm\n")
+                    App.Console.PrintMessage(f"  Batten width: {batten_width}mm\n")
+                    App.Console.PrintMessage(f"  Board thickness: {board_thickness}mm\n")
+                    App.Console.PrintMessage(f"  Batten projection: {batten_projection}mm\n")
+                    App.Console.PrintMessage(f"\n{'='*60}\n")
+                    App.Console.PrintMessage(f"SUCCESS!\n")
+                    App.Console.PrintMessage(f"{'='*60}\n")
+
+                except Exception as e:
+                    App.Console.PrintError(f"\n{'='*60}\n")
+                    App.Console.PrintError(f"ERROR creating final compound: {e}\n")
+                    App.Console.PrintError(f"{'='*60}\n")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                App.Console.PrintError("\nERROR: No faces were successfully processed\n")
