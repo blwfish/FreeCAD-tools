@@ -55,6 +55,7 @@ def get_params_from_spreadsheet(doc):
 
     params = {}
     param_map = {
+        'scale': ['scale', 'Scale', 'modelScale'],
         'bead_spacing': ['bead_spacing', 'BeadSpacing', 'beadSpacing'],
         'bead_depth': ['bead_depth', 'BeadDepth', 'beadDepth', 'materialThickness'],
         'bead_gap': ['bead_gap', 'BeadGap', 'beadGap'],
@@ -318,13 +319,13 @@ def create_bead_board_wall(face, source_object, bead_spacing=DEFAULT_BEAD_SPACIN
     normal = get_face_normal(face)
     print(f"Face normal (local): ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
 
-    # Get horizontal extent
+    # Get horizontal extent (actual face bounds without padding)
     if horizontal_axis == 'x':
-        h_min = bbox.XMin - 0.1
-        h_max = bbox.XMax + 0.1
+        h_min = bbox.XMin
+        h_max = bbox.XMax
     else:
-        h_min = bbox.YMin - 0.1
-        h_max = bbox.YMax + 0.1
+        h_min = bbox.YMin
+        h_max = bbox.YMax
 
     wall_width = h_max - h_min
     num_beads = int(math.ceil(wall_width / bead_spacing))
@@ -340,6 +341,9 @@ def create_bead_board_wall(face, source_object, bead_spacing=DEFAULT_BEAD_SPACIN
             bead_positions.append(bead_center)
 
     print(f"Calculated {len(bead_positions)} bead positions")
+    if len(bead_positions) > 0:
+        print(f"  First: {bead_positions[0]:.2f}, Last: {bead_positions[-1]:.2f}")
+        print(f"  Horizontal range: [{h_min:.2f}, {h_max:.2f}]")
 
     # Create gaps
     print("Creating gaps...")
@@ -374,14 +378,24 @@ def create_bead_board_wall(face, source_object, bead_spacing=DEFAULT_BEAD_SPACIN
     # Trim to face boundary (handles gable edges)
     print("Trimming to face boundary...")
     try:
-        # Extrude face in both directions to create cutting volume
+        # Create a cutting volume from the face (extends inward and outward)
         face_cutter_fwd = face.extrude(normal * (bead_depth + 1.0))
         face_cutter_back = face.extrude(normal * -1.0)
         face_cutter = face_cutter_fwd.fuse(face_cutter_back)
 
+        # Use cut to remove geometry outside face boundary (faster than common)
+        trimmed = face_cutter.cut(fused_gaps)
+        # Actually we want the inverse - the gaps that fall within the face
+        # So use common to find intersection
         trimmed = fused_gaps.common(face_cutter)
         print(f"Trimmed volume: {trimmed.Volume:.2f} mm³")
-        final_beads = trimmed
+
+        # If common resulted in nothing (shell issue), just use fused gaps as-is
+        if trimmed.Volume < 0.001 and fused_gaps.Volume > 0.001:
+            print("  Note: Using unfused gaps (common returned empty)")
+            final_beads = fused_gaps
+        else:
+            final_beads = trimmed
     except Exception as e:
         print(f"Warning: Face trimming failed: {e}")
         final_beads = fused_gaps
@@ -432,24 +446,34 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
         else:
             params = get_params_from_spreadsheet(doc)
 
+            # Get scale factor from spreadsheet, default to 1.0
+            scale = 1.0
+            if params and 'scale' in params:
+                scale = params['scale']
+                App.Console.PrintMessage(f"Using scale from spreadsheet: {scale}\n")
+
+            # Get bead board parameters from spreadsheet, fall back to defaults
             if params:
                 App.Console.PrintMessage("Using parameters from spreadsheet\n")
                 bead_spacing = params.get('bead_spacing', DEFAULT_BEAD_SPACING)
                 bead_depth = params.get('bead_depth', DEFAULT_BEAD_DEPTH)
                 bead_gap = params.get('bead_gap', DEFAULT_BEAD_GAP)
             else:
-                App.Console.PrintMessage("Using HO scale defaults\n")
+                App.Console.PrintMessage("Using hardcoded defaults (no spreadsheet found)\n")
                 bead_spacing = DEFAULT_BEAD_SPACING
                 bead_depth = DEFAULT_BEAD_DEPTH
                 bead_gap = DEFAULT_BEAD_GAP
 
+            # Apply scale factor to spacing (not depth or gap)
+            bead_spacing = bead_spacing / scale
+            App.Console.PrintMessage(f"Adjusted bead spacing: {bead_spacing}mm (original: {DEFAULT_BEAD_SPACING}mm, scale: {scale})\n")
+
             if len(faces_list) > 1:
                 App.Console.PrintMessage(f"\n=== Processing {len(faces_list)} faces ===\n")
 
-            # Collect all bead board from all faces
-            all_beads = []
+            # Process each selected face and create individual objects
             faces_processed = []
-            source_objects = set()
+            result_objects = []
 
             # Process each selected face
             for face_num, (source_obj, face, face_idx) in enumerate(faces_list, 1):
@@ -460,10 +484,29 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         face, source_obj, bead_spacing, bead_depth, bead_gap
                     )
 
-                    # Add this face's beads to the collection
-                    all_beads.append(beads)
-                    faces_processed.append(f"Face{face_idx + 1}")
-                    source_objects.add(source_obj)
+                    # Create individual result object for this face
+                    face_label = f"Face{face_idx + 1}"
+                    result_obj = doc.addObject("Part::Feature", f"BeadBoard_{source_obj.Label}_{face_label}")
+                    result_obj.Label = f"BeadBoard_{source_obj.Label}_{face_label}"
+                    result_obj.Shape = beads
+
+                    # Add metadata
+                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
+                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                    result_obj.addProperty("App::PropertyString", "SourceFace", "Metadata", "Source face")
+                    result_obj.addProperty("App::PropertyFloat", "BeadSpacing", "Metadata", "Bead spacing")
+                    result_obj.addProperty("App::PropertyFloat", "BeadDepth", "Metadata", "Bead depth")
+                    result_obj.addProperty("App::PropertyFloat", "BeadGap", "Metadata", "Bead gap width")
+
+                    result_obj.GeneratorName = GENERATOR_NAME
+                    result_obj.GeneratorVersion = VERSION
+                    result_obj.SourceFace = face_label
+                    result_obj.BeadSpacing = bead_spacing
+                    result_obj.BeadDepth = bead_depth
+                    result_obj.BeadGap = bead_gap
+
+                    result_objects.append(result_obj)
+                    faces_processed.append(face_label)
 
                     App.Console.PrintMessage(f"  ✓ Face{face_idx + 1} complete\n")
 
@@ -473,60 +516,23 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     traceback.print_exc()
                     continue
 
-            # Create final compound of all faces
-            if all_beads:
+            # Summary
+            if result_objects:
+                doc.recompute()
+
                 App.Console.PrintMessage(f"\n{'='*60}\n")
-                App.Console.PrintMessage(f"Creating final compound from {len(faces_processed)} face(s)...\n")
+                App.Console.PrintMessage(f"✓ Created {len(result_objects)} bead board object(s)\n")
                 App.Console.PrintMessage(f"{'='*60}\n")
 
-                try:
-                    # Create single compound shape
-                    if len(all_beads) == 1:
-                        final_shape = all_beads[0]
-                    else:
-                        final_shape = Part.Compound(all_beads)
+                for obj in result_objects:
+                    App.Console.PrintMessage(f"  • {obj.Label}\n")
 
-                    # Determine output name
-                    if len(source_objects) == 1:
-                        obj_name = list(source_objects)[0].Label
-                    else:
-                        obj_name = "MultipleObjects"
-
-                    # Create result object
-                    result_obj = doc.addObject("Part::Feature", f"BeadBoard_{obj_name}")
-                    result_obj.Shape = final_shape
-
-                    # Add metadata
-                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
-                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
-                    result_obj.addProperty("App::PropertyString", "SourceFaces", "Metadata", "Source faces")
-                    result_obj.addProperty("App::PropertyFloat", "BeadSpacing", "Metadata", "Bead spacing")
-                    result_obj.addProperty("App::PropertyFloat", "BeadDepth", "Metadata", "Bead depth")
-                    result_obj.addProperty("App::PropertyFloat", "BeadGap", "Metadata", "Bead gap width")
-
-                    result_obj.GeneratorName = GENERATOR_NAME
-                    result_obj.GeneratorVersion = VERSION
-                    result_obj.SourceFaces = ", ".join(faces_processed)
-                    result_obj.BeadSpacing = bead_spacing
-                    result_obj.BeadDepth = bead_depth
-                    result_obj.BeadGap = bead_gap
-
-                    doc.recompute()
-
-                    App.Console.PrintMessage(f"\n✓ Created: {result_obj.Label}\n")
-                    App.Console.PrintMessage(f"  Faces processed: {len(faces_processed)}\n")
-                    App.Console.PrintMessage(f"  Bead spacing: {bead_spacing}mm\n")
-                    App.Console.PrintMessage(f"  Bead depth: {bead_depth}mm\n")
-                    App.Console.PrintMessage(f"  Bead gap: {bead_gap}mm\n")
-                    App.Console.PrintMessage(f"\n{'='*60}\n")
-                    App.Console.PrintMessage(f"SUCCESS!\n")
-                    App.Console.PrintMessage(f"{'='*60}\n")
-
-                except Exception as e:
-                    App.Console.PrintError(f"\n{'='*60}\n")
-                    App.Console.PrintError(f"ERROR creating final compound: {e}\n")
-                    App.Console.PrintError(f"{'='*60}\n")
-                    import traceback
-                    traceback.print_exc()
+                App.Console.PrintMessage(f"\nParameters used:\n")
+                App.Console.PrintMessage(f"  Bead spacing: {bead_spacing}mm\n")
+                App.Console.PrintMessage(f"  Bead depth: {bead_depth}mm\n")
+                App.Console.PrintMessage(f"  Bead gap: {bead_gap}mm\n")
+                App.Console.PrintMessage(f"\n{'='*60}\n")
+                App.Console.PrintMessage(f"SUCCESS!\n")
+                App.Console.PrintMessage(f"{'='*60}\n")
             else:
                 App.Console.PrintError("\nERROR: No faces were successfully processed\n")
