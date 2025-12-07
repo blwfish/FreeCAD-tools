@@ -1,0 +1,531 @@
+"""
+Parametric Bead Board Trim Generator for FreeCAD v1.0.0
+Generates realistic bead board trim from explicitly selected FACES
+
+Bead board consists of vertical grooves/gaps with thin extrusions above the face.
+The gaps are <<params>>.materialThickness depth (typically 0.20mm),
+creating a recessed groove pattern that's visible after printing.
+
+Author: Generated for model railroading (HO/O/N scale)
+Usage: Click on specific faces in the 3D view, then run this macro
+
+Version History:
+- 1.0.0: Initial release - vertical bead board trim generator
+         Based on board_batten_generator v1.0.0 architecture
+         Supports face-based selection, spreadsheet parameters
+"""
+
+import FreeCAD as App
+import Part
+from FreeCAD import Vector
+import math
+
+VERSION = "1.0.0"
+GENERATOR_NAME = "bead_board_generator"
+
+# Default parameters for HO scale
+DEFAULT_BEAD_SPACING = 101.6    # mm - 4 inches, spacing between bead centers
+DEFAULT_BEAD_DEPTH = 0.20       # mm - how far gaps are extruded above the face
+DEFAULT_BEAD_GAP = 0.20         # mm - width of each gap
+
+
+def find_spreadsheet(doc, preferred_names):
+    """Find spreadsheet by checking both object name and label."""
+    for ss_name in preferred_names:
+        obj = doc.getObject(ss_name)
+        if obj and obj.TypeId == 'Spreadsheet::Sheet':
+            print(f"Found spreadsheet by name: '{ss_name}'")
+            return obj
+
+        for obj in doc.Objects:
+            if obj.TypeId == 'Spreadsheet::Sheet' and obj.Label == ss_name:
+                print(f"Found spreadsheet by label: '{ss_name}' (object name: '{obj.Name}')")
+                return obj
+
+    return None
+
+
+def get_params_from_spreadsheet(doc):
+    """Try to read bead board parameters from spreadsheet."""
+    preferred_names = ["params", "BeadBoardParameters", "BuildingParameters", "Spreadsheet"]
+
+    ss = find_spreadsheet(doc, preferred_names)
+    if ss is None:
+        return None
+
+    params = {}
+    param_map = {
+        'bead_spacing': ['bead_spacing', 'BeadSpacing', 'beadSpacing'],
+        'bead_depth': ['bead_depth', 'BeadDepth', 'beadDepth', 'materialThickness'],
+        'bead_gap': ['bead_gap', 'BeadGap', 'beadGap'],
+    }
+
+    for param_key, possible_names in param_map.items():
+        for name in possible_names:
+            try:
+                val = ss.get(name)
+                if val is not None:
+                    params[param_key] = float(val)
+                    break
+            except:
+                continue
+
+    return params if params else None
+
+
+def check_for_degenerate_edges(wire):
+    """Detect edges with zero or near-zero length."""
+    degenerate = []
+    tolerance = 0.001  # mm
+
+    for i, edge in enumerate(wire.Edges):
+        if edge.Length < tolerance:
+            degenerate.append((i, edge.Length))
+
+    return degenerate
+
+
+def check_for_duplicate_edges(wire):
+    """Detect duplicate or overlapping edges in a wire."""
+    edges = wire.Edges
+    duplicates = []
+    tolerance = 0.001  # mm
+
+    for i in range(len(edges)):
+        for j in range(i + 1, len(edges)):
+            edge1 = edges[i]
+            edge2 = edges[j]
+
+            e1_start = edge1.valueAt(edge1.FirstParameter)
+            e1_end = edge1.valueAt(edge1.LastParameter)
+            e2_start = edge2.valueAt(edge2.FirstParameter)
+            e2_end = edge2.valueAt(edge2.LastParameter)
+
+            if (e1_start.distanceToPoint(e2_start) < tolerance and
+                e1_end.distanceToPoint(e2_end) < tolerance):
+                duplicates.append((i, j))
+            elif (e1_start.distanceToPoint(e2_end) < tolerance and
+                  e1_end.distanceToPoint(e2_start) < tolerance):
+                duplicates.append((i, j))
+
+    return duplicates
+
+
+def validate_wire_geometry(wire, wire_name="Wire"):
+    """Validate wire for common geometry errors."""
+    degenerate = check_for_degenerate_edges(wire)
+    if degenerate:
+        errors = [f"  Edge {i}: length={length:.6f}mm" for i, length in degenerate]
+        raise ValueError(
+            f"{wire_name} has {len(degenerate)} degenerate edge(s):\n" +
+            "\n".join(errors) +
+            "\nThese are likely duplicate/overlapping lines in your sketch.\n" +
+            "Check for stray geometry in the Sketcher!"
+        )
+
+    duplicates = check_for_duplicate_edges(wire)
+    if duplicates:
+        errors = [f"  Edges {i} and {j}" for i, j in duplicates]
+        raise ValueError(
+            f"{wire_name} has {len(duplicates)} duplicate edge(s):\n" +
+            "\n".join(errors) +
+            "\nThese are overlapping lines in your sketch.\n" +
+            "Check for stray geometry in the Sketcher!"
+        )
+
+
+def get_selected_faces():
+    """Get explicitly selected faces from FreeCAD selection."""
+    import FreeCADGui
+
+    faces_list = []
+    selection_ex = FreeCADGui.Selection.getSelectionEx()
+
+    if len(selection_ex) == 0:
+        raise ValueError("No objects selected!")
+
+    for sel_obj in selection_ex:
+        obj = sel_obj.Object
+
+        if not hasattr(obj, 'Shape'):
+            print(f"Warning: '{obj.Label}' has no Shape property")
+            continue
+
+        if len(sel_obj.SubElementNames) > 0:
+            for sub_name in sel_obj.SubElementNames:
+                if sub_name.startswith('Face'):
+                    try:
+                        face_num = int(sub_name[4:]) - 1
+
+                        if face_num < len(obj.Shape.Faces):
+                            face = obj.Shape.Faces[face_num]
+                            faces_list.append((obj, face, face_num))
+                            print(f"  Selected: {sub_name} from '{obj.Label}'")
+                        else:
+                            print(f"Warning: Face index {face_num} out of range for '{obj.Label}'")
+                    except ValueError:
+                        print(f"Warning: Could not parse face number from '{sub_name}'")
+        else:
+            raise ValueError(
+                f"Please select specific FACES, not the whole object!\n"
+                f"Click in the 3D view to select '{obj.Label}',\n"
+                f"then Ctrl+click on the specific faces you want bead board on."
+            )
+
+    if len(faces_list) == 0:
+        raise ValueError("No faces explicitly selected! Please Ctrl+click on the faces you want.")
+
+    return faces_list
+
+
+def get_face_wires(face):
+    """Get wires from a face (outer boundary and holes)."""
+    wires = face.Wires
+
+    if len(wires) == 0:
+        raise ValueError("Face has no wires!")
+
+    outer_wire = max(wires, key=lambda w: abs(Part.Face(w).Area))
+    hole_wires = [w for w in wires if w != outer_wire]
+
+    if not outer_wire.isClosed():
+        raise ValueError("Outer wire is not closed! Cannot generate bead board.")
+
+    for i, hw in enumerate(hole_wires):
+        if not hw.isClosed():
+            raise ValueError(f"Hole wire {i} is not closed!")
+
+    validate_wire_geometry(outer_wire, "Outer wire")
+
+    for i, hw in enumerate(hole_wires):
+        validate_wire_geometry(hw, f"Hole wire {i}")
+
+    return outer_wire, hole_wires
+
+
+def get_face_bounding_box_local(face):
+    """Get bounding box of a face in its local coordinates."""
+    return face.BoundBox
+
+
+def get_face_normal(face):
+    """Get the normal vector of a face at its center."""
+    u_range = face.ParameterRange[:2]
+    v_range = face.ParameterRange[2:]
+    u_mid = (u_range[0] + u_range[1]) / 2
+    v_mid = (v_range[0] + v_range[1]) / 2
+    normal = face.normalAt(u_mid, v_mid)
+    return normal
+
+
+def detect_face_orientation(bbox):
+    """Detect which plane a face lies in based on bounding box extents."""
+    x_extent = bbox.XMax - bbox.XMin
+    y_extent = bbox.YMax - bbox.YMin
+    z_extent = bbox.ZMax - bbox.ZMin
+
+    tolerance = 0.1
+
+    if x_extent < tolerance:
+        return 'z', 'y', 'x'
+    elif y_extent < tolerance:
+        return 'z', 'x', 'y'
+    elif z_extent < tolerance:
+        return 'y', 'x', 'z'
+    else:
+        if z_extent >= y_extent and z_extent >= x_extent:
+            if x_extent > y_extent:
+                return 'z', 'x', 'y'
+            else:
+                return 'z', 'y', 'x'
+        else:
+            return 'y', 'x', 'z'
+
+
+def create_gap(gap_start, gap_end, bbox, bead_depth, vertical_axis, horizontal_axis, normal):
+    """Create a single vertical gap/groove at a bead position."""
+    # Get vertical range
+    if vertical_axis == 'z':
+        v_min = bbox.ZMin - 0.1
+        v_max = bbox.ZMax + 0.1
+    else:
+        v_min = bbox.YMin - 0.1
+        v_max = bbox.YMax + 0.1
+
+    # Create gap shape based on orientation
+    if vertical_axis == 'z':
+        if horizontal_axis == 'x':
+            # YZ plane, gaps run in Z direction
+            base_y = bbox.YMin
+            offset = bead_depth if normal.y > 0 else -bead_depth
+
+            wire = Part.makePolygon([
+                Vector(gap_start, base_y, v_min),
+                Vector(gap_end, base_y, v_min),
+                Vector(gap_end, base_y, v_max),
+                Vector(gap_start, base_y, v_max),
+                Vector(gap_start, base_y, v_min)
+            ])
+            gap = Part.Face(wire).extrude(Vector(0, offset, 0))
+
+        else:  # horizontal_axis == 'y'
+            # XZ plane, gaps run in Z direction
+            base_x = bbox.XMin
+            offset = bead_depth if normal.x > 0 else -bead_depth
+
+            wire = Part.makePolygon([
+                Vector(base_x, gap_start, v_min),
+                Vector(base_x, gap_end, v_min),
+                Vector(base_x, gap_end, v_max),
+                Vector(base_x, gap_start, v_max),
+                Vector(base_x, gap_start, v_min)
+            ])
+            gap = Part.Face(wire).extrude(Vector(offset, 0, 0))
+
+    else:  # vertical_axis == 'y'
+        # XY plane, gaps run in Y direction
+        base_z = 0
+        offset = bead_depth if normal.z > 0 else -bead_depth
+
+        wire = Part.makePolygon([
+            Vector(gap_start, v_min, base_z),
+            Vector(gap_end, v_min, base_z),
+            Vector(gap_end, v_max, base_z),
+            Vector(gap_start, v_max, base_z),
+            Vector(gap_start, v_min, base_z)
+        ])
+        gap = Part.Face(wire).extrude(Vector(0, 0, offset))
+
+    return gap
+
+
+def create_bead_board_wall(face, source_object, bead_spacing=DEFAULT_BEAD_SPACING,
+                           bead_depth=DEFAULT_BEAD_DEPTH,
+                           bead_gap=DEFAULT_BEAD_GAP):
+    """Generate bead board trim from a face."""
+    print(f"\nGenerating bead board for face from '{source_object.Label}' (v{VERSION})...")
+
+    outer_wire, hole_wires = get_face_wires(face)
+
+    bbox = get_face_bounding_box_local(face)
+    print(f"Face bounds: X=[{bbox.XMin:.1f}, {bbox.XMax:.1f}], "
+          f"Y=[{bbox.YMin:.1f}, {bbox.YMax:.1f}], Z=[{bbox.ZMin:.1f}, {bbox.ZMax:.1f}]")
+
+    vertical_axis, horizontal_axis, plane_normal = detect_face_orientation(bbox)
+    print(f"Orientation: vertical={vertical_axis}, horizontal={horizontal_axis}")
+
+    normal = get_face_normal(face)
+    print(f"Face normal (local): ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
+
+    # Get horizontal extent
+    if horizontal_axis == 'x':
+        h_min = bbox.XMin - 0.1
+        h_max = bbox.XMax + 0.1
+    else:
+        h_min = bbox.YMin - 0.1
+        h_max = bbox.YMax + 0.1
+
+    wall_width = h_max - h_min
+    num_beads = int(math.ceil(wall_width / bead_spacing))
+    print(f"Width: {wall_width:.2f}mm = {num_beads} beads @ {bead_spacing}mm spacing")
+    print(f"Gap width: {bead_gap}mm, Gap depth: {bead_depth}mm")
+
+    # Calculate bead positions starting from left edge
+    print("Calculating bead positions...")
+    bead_positions = []
+    for i in range(num_beads):
+        bead_center = h_min + i * bead_spacing
+        if bead_center < h_max:
+            bead_positions.append(bead_center)
+
+    print(f"Calculated {len(bead_positions)} bead positions")
+
+    # Create gaps
+    print("Creating gaps...")
+    gaps = []
+    half_gap = bead_gap / 2
+
+    for i, bead_center in enumerate(bead_positions):
+        gap_start = bead_center - half_gap
+        gap_end = bead_center + half_gap
+
+        try:
+            gap = create_gap(gap_start, gap_end, bbox, bead_depth,
+                           vertical_axis, horizontal_axis, normal)
+            gaps.append(gap)
+        except Exception as e:
+            print(f"Warning: Gap {i} failed: {e}")
+
+    print(f"Created {len(gaps)}/{len(bead_positions)} gaps")
+
+    if len(gaps) == 0:
+        raise RuntimeError("No gaps created!")
+
+    # Fuse all gaps together
+    print("Fusing gaps...")
+    if len(gaps) == 1:
+        fused_gaps = gaps[0]
+    else:
+        fused_gaps = gaps[0].fuse(gaps[1:])
+
+    print(f"Fused volume: {fused_gaps.Volume:.2f} mm³")
+
+    # Trim to face boundary (handles gable edges)
+    print("Trimming to face boundary...")
+    try:
+        # Extrude face in both directions to create cutting volume
+        face_cutter_fwd = face.extrude(normal * (bead_depth + 1.0))
+        face_cutter_back = face.extrude(normal * -1.0)
+        face_cutter = face_cutter_fwd.fuse(face_cutter_back)
+
+        trimmed = fused_gaps.common(face_cutter)
+        print(f"Trimmed volume: {trimmed.Volume:.2f} mm³")
+        final_beads = trimmed
+    except Exception as e:
+        print(f"Warning: Face trimming failed: {e}")
+        final_beads = fused_gaps
+
+    # Cut holes
+    print(f"Cutting {len(hole_wires)} holes...")
+    result = final_beads
+
+    holes_cut = 0
+    for i, hole_wire in enumerate(hole_wires):
+        try:
+            hole_face = Part.Face(hole_wire)
+            hole_volume_fwd = hole_face.extrude(normal * (bead_depth + 1.0))
+            hole_volume_back = hole_face.extrude(normal * -1.0)
+            hole_volume = hole_volume_fwd.fuse(hole_volume_back)
+
+            volume_before = result.Volume
+            result = result.cut(hole_volume)
+            volume_after = result.Volume
+
+            if volume_before - volume_after > 0.001:
+                holes_cut += 1
+                print(f"  Hole {i}: OK")
+        except Exception as e:
+            print(f"  Warning: Hole {i} failed: {e}")
+
+    print(f"Cut {holes_cut}/{len(hole_wires)} holes")
+
+    print(f"\nBead board complete")
+    print(f"Final volume: {result.Volume:.2f} mm³")
+    return result
+
+
+# Main execution
+if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins__':
+    doc = App.activeDocument()
+    if doc is None:
+        App.Console.PrintError("No active document!\n")
+    else:
+        try:
+            faces_list = get_selected_faces()
+        except ValueError as e:
+            App.Console.PrintError(f"Error: {e}\n")
+            faces_list = []
+
+        if len(faces_list) == 0:
+            App.Console.PrintError("No faces selected!\n")
+        else:
+            params = get_params_from_spreadsheet(doc)
+
+            if params:
+                App.Console.PrintMessage("Using parameters from spreadsheet\n")
+                bead_spacing = params.get('bead_spacing', DEFAULT_BEAD_SPACING)
+                bead_depth = params.get('bead_depth', DEFAULT_BEAD_DEPTH)
+                bead_gap = params.get('bead_gap', DEFAULT_BEAD_GAP)
+            else:
+                App.Console.PrintMessage("Using HO scale defaults\n")
+                bead_spacing = DEFAULT_BEAD_SPACING
+                bead_depth = DEFAULT_BEAD_DEPTH
+                bead_gap = DEFAULT_BEAD_GAP
+
+            if len(faces_list) > 1:
+                App.Console.PrintMessage(f"\n=== Processing {len(faces_list)} faces ===\n")
+
+            # Collect all bead board from all faces
+            all_beads = []
+            faces_processed = []
+            source_objects = set()
+
+            # Process each selected face
+            for face_num, (source_obj, face, face_idx) in enumerate(faces_list, 1):
+                try:
+                    App.Console.PrintMessage(f"\n--- Processing face {face_num}/{len(faces_list)}: Face{face_idx + 1} from '{source_obj.Label}' ---\n")
+
+                    beads = create_bead_board_wall(
+                        face, source_obj, bead_spacing, bead_depth, bead_gap
+                    )
+
+                    # Add this face's beads to the collection
+                    all_beads.append(beads)
+                    faces_processed.append(f"Face{face_idx + 1}")
+                    source_objects.add(source_obj)
+
+                    App.Console.PrintMessage(f"  ✓ Face{face_idx + 1} complete\n")
+
+                except Exception as e:
+                    App.Console.PrintError(f"  ✗ Face{face_idx + 1} from '{source_obj.Label}': {e}\n")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+            # Create final compound of all faces
+            if all_beads:
+                App.Console.PrintMessage(f"\n{'='*60}\n")
+                App.Console.PrintMessage(f"Creating final compound from {len(faces_processed)} face(s)...\n")
+                App.Console.PrintMessage(f"{'='*60}\n")
+
+                try:
+                    # Create single compound shape
+                    if len(all_beads) == 1:
+                        final_shape = all_beads[0]
+                    else:
+                        final_shape = Part.Compound(all_beads)
+
+                    # Determine output name
+                    if len(source_objects) == 1:
+                        obj_name = list(source_objects)[0].Label
+                    else:
+                        obj_name = "MultipleObjects"
+
+                    # Create result object
+                    result_obj = doc.addObject("Part::Feature", f"BeadBoard_{obj_name}")
+                    result_obj.Shape = final_shape
+
+                    # Add metadata
+                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
+                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                    result_obj.addProperty("App::PropertyString", "SourceFaces", "Metadata", "Source faces")
+                    result_obj.addProperty("App::PropertyFloat", "BeadSpacing", "Metadata", "Bead spacing")
+                    result_obj.addProperty("App::PropertyFloat", "BeadDepth", "Metadata", "Bead depth")
+                    result_obj.addProperty("App::PropertyFloat", "BeadGap", "Metadata", "Bead gap width")
+
+                    result_obj.GeneratorName = GENERATOR_NAME
+                    result_obj.GeneratorVersion = VERSION
+                    result_obj.SourceFaces = ", ".join(faces_processed)
+                    result_obj.BeadSpacing = bead_spacing
+                    result_obj.BeadDepth = bead_depth
+                    result_obj.BeadGap = bead_gap
+
+                    doc.recompute()
+
+                    App.Console.PrintMessage(f"\n✓ Created: {result_obj.Label}\n")
+                    App.Console.PrintMessage(f"  Faces processed: {len(faces_processed)}\n")
+                    App.Console.PrintMessage(f"  Bead spacing: {bead_spacing}mm\n")
+                    App.Console.PrintMessage(f"  Bead depth: {bead_depth}mm\n")
+                    App.Console.PrintMessage(f"  Bead gap: {bead_gap}mm\n")
+                    App.Console.PrintMessage(f"\n{'='*60}\n")
+                    App.Console.PrintMessage(f"SUCCESS!\n")
+                    App.Console.PrintMessage(f"{'='*60}\n")
+
+                except Exception as e:
+                    App.Console.PrintError(f"\n{'='*60}\n")
+                    App.Console.PrintError(f"ERROR creating final compound: {e}\n")
+                    App.Console.PrintError(f"{'='*60}\n")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                App.Console.PrintError("\nERROR: No faces were successfully processed\n")
