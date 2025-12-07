@@ -256,8 +256,9 @@ def create_gap(gap_start, gap_end, bbox, bead_depth, vertical_axis, horizontal_a
     if vertical_axis == 'z':
         if horizontal_axis == 'x':
             # YZ plane, gaps run in Z direction
+            # Position gap at face location, extrude inward (negative direction relative to normal)
             base_y = bbox.YMin
-            offset = bead_depth if normal.y > 0 else -bead_depth
+            offset = -bead_depth if normal.y > 0 else bead_depth
 
             wire = Part.makePolygon([
                 Vector(gap_start, base_y, v_min),
@@ -271,7 +272,7 @@ def create_gap(gap_start, gap_end, bbox, bead_depth, vertical_axis, horizontal_a
         else:  # horizontal_axis == 'y'
             # XZ plane, gaps run in Z direction
             base_x = bbox.XMin
-            offset = bead_depth if normal.x > 0 else -bead_depth
+            offset = -bead_depth if normal.x > 0 else bead_depth
 
             wire = Part.makePolygon([
                 Vector(base_x, gap_start, v_min),
@@ -285,7 +286,7 @@ def create_gap(gap_start, gap_end, bbox, bead_depth, vertical_axis, horizontal_a
     else:  # vertical_axis == 'y'
         # XY plane, gaps run in Y direction
         base_z = 0
-        offset = bead_depth if normal.z > 0 else -bead_depth
+        offset = -bead_depth if normal.z > 0 else bead_depth
 
         wire = Part.makePolygon([
             Vector(gap_start, v_min, base_z),
