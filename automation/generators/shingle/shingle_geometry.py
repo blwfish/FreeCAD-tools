@@ -1,11 +1,15 @@
 """
-Shingle Geometry Library v4.0.0
+Shingle Geometry Library v5.0.0
 
 Pure Python geometry functions for shingle generation.
 These functions are testable without FreeCAD and can be used in pytest.
 
 No dependencies on FreeCAD.Part, FreeCAD.Vector, etc.
 Uses standard Python types (tuples, dicts, lists) for I/O.
+
+v5.0.0: Added bounding-box based orientation detection for reliable
+        eave-to-ridge direction finding. Also added Z-based valley/ridge
+        detection for smart trim functionality.
 """
 
 import math
@@ -430,25 +434,25 @@ def should_clip_shingles(material_thickness: float) -> bool:
     return material_thickness < 1.0
 
 
-def calculate_shingle_clip_volume(face_bounds: Dict, 
+def calculate_shingle_clip_volume(face_bounds: Dict,
                                   material_thickness: float) -> Dict:
     """
     Calculate the volume for clipping shingles to face boundary.
-    
+
     Creates a "clipping box" that represents the valid region for shingles
     (the face + a small margin for material thickness).
-    
+
     Args:
         face_bounds: Dict with 'x_min', 'x_max', 'y_min', 'y_max', 'z_min', 'z_max'
         material_thickness: Thickness of material (mm)
-    
+
     Returns:
         Dict describing the clipping volume:
             - bounds: expanded bounds with material_thickness margin
             - needs_clipping: whether clipping is necessary
     """
     margin = material_thickness  # Only expand by actual material thickness
-    
+
     return {
         'x_min': face_bounds.get('x_min', 0) - margin,
         'x_max': face_bounds.get('x_max', 0) + margin,
@@ -457,4 +461,459 @@ def calculate_shingle_clip_volume(face_bounds: Dict,
         'z_min': face_bounds.get('z_min', 0) - margin,
         'z_max': face_bounds.get('z_max', 0) + margin,
         'needs_clipping': True
+    }
+
+
+# =============================================================================
+# Bounding-Box Based Orientation Detection (v5.0.0)
+# =============================================================================
+
+def find_eave_and_ridge_vertices(vertices: List[Tuple[float, float, float]],
+                                  z_tolerance: float = 0.1) -> Dict:
+    """
+    Find the eave (lowest Z) and ridge (highest Z) vertices of a roof face.
+
+    This is the foundation for bounding-box based orientation detection.
+    Instead of relying on normals (which can point either way), we use
+    the physical geometry: water flows downhill, so the lowest Z vertices
+    are the eave and highest Z are the ridge.
+
+    Args:
+        vertices: List of (x, y, z) tuples representing face vertices
+        z_tolerance: Tolerance for grouping vertices at same Z level (mm)
+
+    Returns:
+        Dict with:
+            - eave_vertices: List of vertices at the lowest Z level
+            - ridge_vertices: List of vertices at the highest Z level
+            - eave_z: Z coordinate of eave
+            - ridge_z: Z coordinate of ridge
+            - eave_center: (x, y, z) centroid of eave vertices
+            - ridge_center: (x, y, z) centroid of ridge vertices
+            - slope_rise: Vertical rise from eave to ridge (ridge_z - eave_z)
+    """
+    if not vertices:
+        raise ValueError("Cannot find eave/ridge from empty vertex list")
+
+    # Find Z range
+    z_coords = [v[2] for v in vertices]
+    z_min = min(z_coords)
+    z_max = max(z_coords)
+
+    # Group vertices by Z level
+    eave_vertices = [v for v in vertices if abs(v[2] - z_min) <= z_tolerance]
+    ridge_vertices = [v for v in vertices if abs(v[2] - z_max) <= z_tolerance]
+
+    # Calculate centroids
+    def centroid(verts):
+        n = len(verts)
+        if n == 0:
+            return (0, 0, 0)
+        return (
+            sum(v[0] for v in verts) / n,
+            sum(v[1] for v in verts) / n,
+            sum(v[2] for v in verts) / n
+        )
+
+    eave_center = centroid(eave_vertices)
+    ridge_center = centroid(ridge_vertices)
+
+    return {
+        'eave_vertices': eave_vertices,
+        'ridge_vertices': ridge_vertices,
+        'eave_z': z_min,
+        'ridge_z': z_max,
+        'eave_center': eave_center,
+        'ridge_center': ridge_center,
+        'slope_rise': z_max - z_min
+    }
+
+
+def calculate_upslope_direction(vertices: List[Tuple[float, float, float]],
+                                 z_tolerance: float = 0.1) -> Tuple[float, float, float]:
+    """
+    Calculate the unit vector pointing up the roof slope (eave to ridge).
+
+    This is the key function for orientation detection. By using vertex
+    Z coordinates instead of face normals, we get a reliable "up the roof"
+    direction regardless of how the geometry was constructed.
+
+    Args:
+        vertices: List of (x, y, z) tuples representing face vertices
+        z_tolerance: Tolerance for grouping vertices at same Z level (mm)
+
+    Returns:
+        Tuple (x, y, z) unit vector pointing from eave toward ridge
+    """
+    eave_ridge = find_eave_and_ridge_vertices(vertices, z_tolerance)
+
+    eave = eave_ridge['eave_center']
+    ridge = eave_ridge['ridge_center']
+
+    # Vector from eave to ridge
+    dx = ridge[0] - eave[0]
+    dy = ridge[1] - eave[1]
+    dz = ridge[2] - eave[2]
+
+    # Normalize
+    length = math.sqrt(dx*dx + dy*dy + dz*dz)
+    if length < 0.001:
+        # Flat roof - no slope, return arbitrary up direction
+        return (0, 0, 1)
+
+    return (dx / length, dy / length, dz / length)
+
+
+def calculate_across_roof_direction(vertices: List[Tuple[float, float, float]],
+                                     upslope: Tuple[float, float, float],
+                                     face_normal: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    """
+    Calculate the unit vector pointing across the roof (perpendicular to upslope).
+
+    Uses cross product of upslope and face normal to get the horizontal
+    direction along the roof surface.
+
+    Args:
+        vertices: List of (x, y, z) tuples (used for context, not calculation)
+        upslope: Unit vector pointing up the slope
+        face_normal: Unit vector normal to the face
+
+    Returns:
+        Tuple (x, y, z) unit vector pointing across the roof (U direction)
+    """
+    # Cross product: normal × upslope gives across direction
+    # (right-hand rule: if normal points out and upslope points up, across points right)
+    ux = face_normal[1] * upslope[2] - face_normal[2] * upslope[1]
+    uy = face_normal[2] * upslope[0] - face_normal[0] * upslope[2]
+    uz = face_normal[0] * upslope[1] - face_normal[1] * upslope[0]
+
+    # Normalize
+    length = math.sqrt(ux*ux + uy*uy + uz*uz)
+    if length < 0.001:
+        # Degenerate case - upslope parallel to normal (shouldn't happen on real roof)
+        return (1, 0, 0)
+
+    return (ux / length, uy / length, uz / length)
+
+
+def get_roof_coordinate_system(vertices: List[Tuple[float, float, float]],
+                                face_normal: Tuple[float, float, float],
+                                z_tolerance: float = 0.1) -> Dict:
+    """
+    Get a complete coordinate system for a roof face using bounding-box method.
+
+    This replaces normal-based orientation detection with a more reliable
+    approach based on vertex Z coordinates.
+
+    Args:
+        vertices: List of (x, y, z) tuples representing face vertices
+        face_normal: Unit vector normal to the face (from FreeCAD)
+        z_tolerance: Tolerance for grouping vertices at same Z level (mm)
+
+    Returns:
+        Dict with:
+            - origin: (x, y, z) starting point (lowest-Z corner vertex)
+            - u_vec: (x, y, z) unit vector across the roof (width direction)
+            - v_vec: (x, y, z) unit vector up the slope (height direction)
+            - normal: (x, y, z) corrected face normal (pointing outward)
+            - eave_ridge_info: Dict from find_eave_and_ridge_vertices
+    """
+    if len(vertices) < 3:
+        raise ValueError(f"Need at least 3 vertices, got {len(vertices)}")
+
+    # Get eave/ridge info
+    eave_ridge = find_eave_and_ridge_vertices(vertices, z_tolerance)
+
+    # Calculate upslope direction (V)
+    v_vec = calculate_upslope_direction(vertices, z_tolerance)
+
+    # Calculate across direction (U)
+    u_vec = calculate_across_roof_direction(vertices, v_vec, face_normal)
+
+    # Verify/correct normal direction
+    # The normal should be consistent with U × V (right-hand rule)
+    expected_normal = (
+        u_vec[1] * v_vec[2] - u_vec[2] * v_vec[1],
+        u_vec[2] * v_vec[0] - u_vec[0] * v_vec[2],
+        u_vec[0] * v_vec[1] - u_vec[1] * v_vec[0]
+    )
+
+    # Check if face_normal agrees with expected_normal
+    dot = (face_normal[0] * expected_normal[0] +
+           face_normal[1] * expected_normal[1] +
+           face_normal[2] * expected_normal[2])
+
+    if dot < 0:
+        # Normal is flipped - use corrected version
+        corrected_normal = expected_normal
+    else:
+        corrected_normal = face_normal
+
+    # Find origin: prefer corner vertex (2 edges) at lowest Z
+    # For now, just use the first eave vertex
+    origin = eave_ridge['eave_vertices'][0] if eave_ridge['eave_vertices'] else vertices[0]
+
+    return {
+        'origin': origin,
+        'u_vec': u_vec,
+        'v_vec': v_vec,
+        'normal': corrected_normal,
+        'eave_ridge_info': eave_ridge
+    }
+
+
+# =============================================================================
+# Smart Trim: Valley/Ridge Detection (v5.0.0)
+# =============================================================================
+
+def find_coincident_edges(face1_edges: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
+                          face2_edges: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
+                          tolerance: float = 0.5) -> List[Dict]:
+    """
+    Find edges that are shared (coincident) between two faces.
+
+    Args:
+        face1_edges: List of edges as ((x1,y1,z1), (x2,y2,z2)) tuples
+        face2_edges: List of edges as ((x1,y1,z1), (x2,y2,z2)) tuples
+        tolerance: Distance tolerance for considering vertices coincident (mm)
+
+    Returns:
+        List of dicts describing coincident edges:
+            - edge1: The edge from face1
+            - edge2: The edge from face2
+            - midpoint: (x, y, z) midpoint of the shared edge
+            - length: Length of the shared edge
+    """
+    def points_coincident(p1, p2, tol):
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+        dz = p1[2] - p2[2]
+        return math.sqrt(dx*dx + dy*dy + dz*dz) <= tol
+
+    def edges_coincident(e1, e2, tol):
+        # Check if e1 endpoints match e2 endpoints (in either order)
+        return ((points_coincident(e1[0], e2[0], tol) and points_coincident(e1[1], e2[1], tol)) or
+                (points_coincident(e1[0], e2[1], tol) and points_coincident(e1[1], e2[0], tol)))
+
+    coincident = []
+    for e1 in face1_edges:
+        for e2 in face2_edges:
+            if edges_coincident(e1, e2, tolerance):
+                # Calculate midpoint and length
+                mid = (
+                    (e1[0][0] + e1[1][0]) / 2,
+                    (e1[0][1] + e1[1][1]) / 2,
+                    (e1[0][2] + e1[1][2]) / 2
+                )
+                dx = e1[1][0] - e1[0][0]
+                dy = e1[1][1] - e1[0][1]
+                dz = e1[1][2] - e1[0][2]
+                length = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+                coincident.append({
+                    'edge1': e1,
+                    'edge2': e2,
+                    'midpoint': mid,
+                    'length': length
+                })
+
+    return coincident
+
+
+def classify_roof_intersection(face1_vertices: List[Tuple[float, float, float]],
+                                face2_vertices: List[Tuple[float, float, float]],
+                                shared_edge: Tuple[Tuple[float, float, float], Tuple[float, float, float]],
+                                z_tolerance: float = 0.1) -> Dict:
+    """
+    Classify a roof intersection as valley or ridge based on Z coordinates.
+
+    The key insight: at a shared edge between two roof faces:
+    - If the NON-SHARED vertices of both faces are BELOW the shared edge → RIDGE/HIP
+    - If the NON-SHARED vertices of both faces are ABOVE the shared edge → VALLEY
+
+    This is geometrically unambiguous and doesn't depend on normal directions.
+
+    Args:
+        face1_vertices: Vertices of first face
+        face2_vertices: Vertices of second face
+        shared_edge: The edge shared by both faces ((x1,y1,z1), (x2,y2,z2))
+        z_tolerance: Tolerance for considering vertices "on" the edge (mm)
+
+    Returns:
+        Dict with:
+            - classification: 'valley', 'ridge', or 'ambiguous'
+            - shared_edge_z: Average Z of shared edge
+            - face1_other_z: Average Z of non-shared vertices of face1
+            - face2_other_z: Average Z of non-shared vertices of face2
+            - confidence: 'high', 'medium', or 'low'
+    """
+    # Get Z of shared edge
+    edge_z = (shared_edge[0][2] + shared_edge[1][2]) / 2
+
+    def is_on_edge(vertex, edge, tol):
+        # Check if vertex is one of the edge endpoints
+        for ep in edge:
+            dx = vertex[0] - ep[0]
+            dy = vertex[1] - ep[1]
+            dz = vertex[2] - ep[2]
+            if math.sqrt(dx*dx + dy*dy + dz*dz) <= tol:
+                return True
+        return False
+
+    # Find non-shared vertices for each face
+    face1_other = [v for v in face1_vertices if not is_on_edge(v, shared_edge, z_tolerance * 5)]
+    face2_other = [v for v in face2_vertices if not is_on_edge(v, shared_edge, z_tolerance * 5)]
+
+    if not face1_other or not face2_other:
+        return {
+            'classification': 'ambiguous',
+            'shared_edge_z': edge_z,
+            'face1_other_z': None,
+            'face2_other_z': None,
+            'confidence': 'low',
+            'reason': 'Could not identify non-shared vertices'
+        }
+
+    # Average Z of non-shared vertices
+    face1_other_z = sum(v[2] for v in face1_other) / len(face1_other)
+    face2_other_z = sum(v[2] for v in face2_other) / len(face2_other)
+
+    # Classification logic
+    face1_below = face1_other_z < edge_z - z_tolerance
+    face1_above = face1_other_z > edge_z + z_tolerance
+    face2_below = face2_other_z < edge_z - z_tolerance
+    face2_above = face2_other_z > edge_z + z_tolerance
+
+    if face1_below and face2_below:
+        # Both faces slope DOWN from the shared edge → RIDGE/HIP
+        classification = 'ridge'
+        confidence = 'high'
+    elif face1_above and face2_above:
+        # Both faces slope UP from the shared edge → VALLEY
+        classification = 'valley'
+        confidence = 'high'
+    elif (face1_below and face2_above) or (face1_above and face2_below):
+        # One up, one down - this is unusual but could be a complex intersection
+        classification = 'ambiguous'
+        confidence = 'low'
+    else:
+        # Near-flat or edge case
+        classification = 'ambiguous'
+        confidence = 'medium'
+
+    return {
+        'classification': classification,
+        'shared_edge_z': edge_z,
+        'face1_other_z': face1_other_z,
+        'face2_other_z': face2_other_z,
+        'confidence': confidence
+    }
+
+
+def calculate_dihedral_angle(face1_normal: Tuple[float, float, float],
+                              face2_normal: Tuple[float, float, float]) -> Dict:
+    """
+    Calculate the dihedral angle between two face normals.
+
+    Args:
+        face1_normal: Unit normal vector of first face
+        face2_normal: Unit normal vector of second face
+
+    Returns:
+        Dict with:
+            - angle_degrees: Angle between normals (0-180)
+            - angle_radians: Same in radians
+            - trim_angle_degrees: The angle to cut each side (angle/2 or 90-angle/2)
+    """
+    # Dot product of normals
+    dot = (face1_normal[0] * face2_normal[0] +
+           face1_normal[1] * face2_normal[1] +
+           face1_normal[2] * face2_normal[2])
+
+    # Clamp to [-1, 1] for numerical stability
+    dot = max(-1.0, min(1.0, dot))
+
+    angle_rad = math.acos(dot)
+    angle_deg = math.degrees(angle_rad)
+
+    # The trim angle is typically half the dihedral angle
+    # For a 90° dihedral, each piece is cut at 45°
+    trim_angle = angle_deg / 2
+
+    return {
+        'angle_degrees': angle_deg,
+        'angle_radians': angle_rad,
+        'trim_angle_degrees': trim_angle
+    }
+
+
+def analyze_roof_intersection(face1_vertices: List[Tuple[float, float, float]],
+                               face1_normal: Tuple[float, float, float],
+                               face1_edges: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
+                               face2_vertices: List[Tuple[float, float, float]],
+                               face2_normal: Tuple[float, float, float],
+                               face2_edges: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
+                               tolerance: float = 0.5) -> Dict:
+    """
+    Complete analysis of the intersection between two roof faces.
+
+    Combines edge detection, valley/ridge classification, and angle calculation.
+
+    Args:
+        face1_vertices: Vertices of first face
+        face1_normal: Normal of first face
+        face1_edges: Edges of first face
+        face2_vertices: Vertices of second face
+        face2_normal: Normal of second face
+        face2_edges: Edges of second face
+        tolerance: Distance tolerance for edge matching (mm)
+
+    Returns:
+        Dict with complete intersection analysis:
+            - has_shared_edge: Whether faces share an edge
+            - shared_edges: List of shared edges found
+            - classification: 'valley', 'ridge', or 'ambiguous'
+            - dihedral_angle: Angle information dict
+            - trim_recommendation: Human-readable trim advice
+    """
+    # Find shared edges
+    shared = find_coincident_edges(face1_edges, face2_edges, tolerance)
+
+    if not shared:
+        return {
+            'has_shared_edge': False,
+            'shared_edges': [],
+            'classification': 'none',
+            'dihedral_angle': None,
+            'trim_recommendation': 'Faces do not share an edge'
+        }
+
+    # Use the longest shared edge for analysis
+    longest_edge = max(shared, key=lambda e: e['length'])
+
+    # Classify the intersection
+    classification = classify_roof_intersection(
+        face1_vertices, face2_vertices,
+        longest_edge['edge1'],
+        tolerance
+    )
+
+    # Calculate dihedral angle
+    dihedral = calculate_dihedral_angle(face1_normal, face2_normal)
+
+    # Generate recommendation
+    if classification['classification'] == 'valley':
+        rec = f"VALLEY: Cut shingles at {dihedral['trim_angle_degrees']:.1f}° from each side"
+    elif classification['classification'] == 'ridge':
+        rec = f"RIDGE/HIP: Cut shingles at {dihedral['trim_angle_degrees']:.1f}° from each side"
+    else:
+        rec = f"AMBIGUOUS: Dihedral angle is {dihedral['angle_degrees']:.1f}°, verify visually"
+
+    return {
+        'has_shared_edge': True,
+        'shared_edges': shared,
+        'classification': classification['classification'],
+        'classification_details': classification,
+        'dihedral_angle': dihedral,
+        'trim_recommendation': rec
     }

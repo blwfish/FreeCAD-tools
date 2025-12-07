@@ -21,6 +21,16 @@ from shingle_geometry import (
     get_orientation_description,
     calculate_shingle_position,
     validate_collar_margin,
+    # v5.0.0: Bounding-box based orientation
+    find_eave_and_ridge_vertices,
+    calculate_upslope_direction,
+    calculate_across_roof_direction,
+    get_roof_coordinate_system,
+    # v5.0.0: Smart trim functions
+    find_coincident_edges,
+    classify_roof_intersection,
+    calculate_dihedral_angle,
+    analyze_roof_intersection,
 )
 
 
@@ -533,6 +543,354 @@ class TestIntegration:
         # Should calculate reasonable layout
         layout = calculate_layout(500.0, 300.0, 10.0, 15.0)
         assert layout['num_courses'] >= 20
+
+
+# =============================================================================
+# v5.0.0: Bounding-Box Based Orientation Tests
+# =============================================================================
+
+class TestEaveRidgeDetection:
+    """Tests for find_eave_and_ridge_vertices()"""
+
+    def test_simple_sloped_roof(self):
+        """Simple roof face sloping up in Y direction"""
+        vertices = [
+            (0, 0, 0),      # Eave left
+            (100, 0, 0),    # Eave right
+            (100, 100, 50), # Ridge right
+            (0, 100, 50),   # Ridge left
+        ]
+        result = find_eave_and_ridge_vertices(vertices)
+
+        assert result['eave_z'] == 0
+        assert result['ridge_z'] == 50
+        assert len(result['eave_vertices']) == 2
+        assert len(result['ridge_vertices']) == 2
+        assert result['slope_rise'] == 50
+
+    def test_symmetric_gable_left_side(self):
+        """Left side of symmetric gable roof"""
+        vertices = [
+            (0, 0, 0),      # Eave front-left
+            (0, 100, 0),    # Eave back-left
+            (50, 100, 50),  # Ridge back
+            (50, 0, 50),    # Ridge front
+        ]
+        result = find_eave_and_ridge_vertices(vertices)
+
+        assert result['eave_z'] == 0
+        assert result['ridge_z'] == 50
+        # Eave center should be at x=0
+        assert result['eave_center'][0] == 0
+        # Ridge center should be at x=50
+        assert result['ridge_center'][0] == 50
+
+    def test_symmetric_gable_right_side(self):
+        """Right side of symmetric gable roof - should also work correctly"""
+        vertices = [
+            (50, 0, 50),    # Ridge front
+            (50, 100, 50),  # Ridge back
+            (100, 100, 0),  # Eave back-right
+            (100, 0, 0),    # Eave front-right
+        ]
+        result = find_eave_and_ridge_vertices(vertices)
+
+        assert result['eave_z'] == 0
+        assert result['ridge_z'] == 50
+        # Eave center should be at x=100
+        assert result['eave_center'][0] == 100
+        # Ridge center should be at x=50
+        assert result['ridge_center'][0] == 50
+
+
+class TestUpslopeDirection:
+    """Tests for calculate_upslope_direction()"""
+
+    def test_simple_slope_up_y(self):
+        """Roof sloping up in positive Y direction"""
+        vertices = [
+            (0, 0, 0),
+            (100, 0, 0),
+            (100, 100, 50),
+            (0, 100, 50),
+        ]
+        upslope = calculate_upslope_direction(vertices)
+
+        # Should point in positive Y and positive Z direction
+        assert upslope[1] > 0  # Positive Y
+        assert upslope[2] > 0  # Positive Z
+        # Should be normalized
+        length = math.sqrt(upslope[0]**2 + upslope[1]**2 + upslope[2]**2)
+        assert abs(length - 1.0) < 0.001
+
+    def test_gable_left_side(self):
+        """Left side of gable - should point toward ridge (positive X)"""
+        vertices = [
+            (0, 0, 0),
+            (0, 100, 0),
+            (50, 100, 50),
+            (50, 0, 50),
+        ]
+        upslope = calculate_upslope_direction(vertices)
+
+        # Should point toward ridge (positive X, positive Z)
+        assert upslope[0] > 0  # Positive X (toward ridge)
+        assert upslope[2] > 0  # Positive Z (upward)
+
+    def test_gable_right_side(self):
+        """Right side of gable - should point toward ridge (negative X)"""
+        vertices = [
+            (50, 0, 50),
+            (50, 100, 50),
+            (100, 100, 0),
+            (100, 0, 0),
+        ]
+        upslope = calculate_upslope_direction(vertices)
+
+        # Should point toward ridge (negative X, positive Z)
+        assert upslope[0] < 0  # Negative X (toward ridge from right side)
+        assert upslope[2] > 0  # Positive Z (upward)
+
+
+class TestRoofCoordinateSystem:
+    """Tests for get_roof_coordinate_system()"""
+
+    def test_coordinate_system_orthogonal(self):
+        """U, V, and normal should be mutually orthogonal"""
+        vertices = [
+            (0, 0, 0),
+            (100, 0, 0),
+            (100, 100, 50),
+            (0, 100, 50),
+        ]
+        normal = (0, -0.447, 0.894)  # Approximate normal for this slope
+
+        result = get_roof_coordinate_system(vertices, normal)
+
+        u = result['u_vec']
+        v = result['v_vec']
+        n = result['normal']
+
+        # U dot V should be ~0
+        uv_dot = u[0]*v[0] + u[1]*v[1] + u[2]*v[2]
+        assert abs(uv_dot) < 0.01
+
+        # U dot N should be ~0
+        un_dot = u[0]*n[0] + u[1]*n[1] + u[2]*n[2]
+        assert abs(un_dot) < 0.01
+
+        # V dot N should be ~0
+        vn_dot = v[0]*n[0] + v[1]*n[1] + v[2]*n[2]
+        assert abs(vn_dot) < 0.01
+
+    def test_v_points_upslope(self):
+        """V vector should always have positive Z component (pointing up slope)"""
+        # Test both sides of a gable roof
+        left_vertices = [
+            (0, 0, 0),
+            (0, 100, 0),
+            (50, 100, 50),
+            (50, 0, 50),
+        ]
+        right_vertices = [
+            (50, 0, 50),
+            (50, 100, 50),
+            (100, 100, 0),
+            (100, 0, 0),
+        ]
+
+        # Use a generic upward-pointing normal for both
+        normal_left = (0.707, 0, 0.707)
+        normal_right = (-0.707, 0, 0.707)
+
+        result_left = get_roof_coordinate_system(left_vertices, normal_left)
+        result_right = get_roof_coordinate_system(right_vertices, normal_right)
+
+        # Both V vectors should have positive Z
+        assert result_left['v_vec'][2] > 0
+        assert result_right['v_vec'][2] > 0
+
+
+# =============================================================================
+# v5.0.0: Smart Trim Tests
+# =============================================================================
+
+class TestCoincidentEdges:
+    """Tests for find_coincident_edges()"""
+
+    def test_shared_edge_found(self):
+        """Two faces sharing an edge should detect the shared edge"""
+        # Left roof face edges
+        face1_edges = [
+            ((0, 0, 0), (0, 100, 0)),       # Left edge
+            ((0, 100, 0), (50, 100, 50)),   # Top edge
+            ((50, 100, 50), (50, 0, 50)),   # Ridge edge (shared)
+            ((50, 0, 50), (0, 0, 0)),       # Bottom edge
+        ]
+        # Right roof face edges
+        face2_edges = [
+            ((50, 0, 50), (50, 100, 50)),   # Ridge edge (shared)
+            ((50, 100, 50), (100, 100, 0)), # Top edge
+            ((100, 100, 0), (100, 0, 0)),   # Right edge
+            ((100, 0, 0), (50, 0, 50)),     # Bottom edge
+        ]
+
+        result = find_coincident_edges(face1_edges, face2_edges, tolerance=0.5)
+
+        assert len(result) == 1
+        assert result[0]['length'] == 100  # Ridge is 100 units long
+
+    def test_no_shared_edges(self):
+        """Faces with no shared edges should return empty list"""
+        face1_edges = [
+            ((0, 0, 0), (10, 0, 0)),
+            ((10, 0, 0), (10, 10, 0)),
+            ((10, 10, 0), (0, 10, 0)),
+            ((0, 10, 0), (0, 0, 0)),
+        ]
+        face2_edges = [
+            ((100, 0, 0), (110, 0, 0)),
+            ((110, 0, 0), (110, 10, 0)),
+            ((110, 10, 0), (100, 10, 0)),
+            ((100, 10, 0), (100, 0, 0)),
+        ]
+
+        result = find_coincident_edges(face1_edges, face2_edges)
+
+        assert len(result) == 0
+
+
+class TestRoofIntersectionClassification:
+    """Tests for classify_roof_intersection()"""
+
+    def test_ridge_classification(self):
+        """Ridge: non-shared vertices are BELOW the shared edge"""
+        # Shared edge at z=50 (the ridge)
+        shared_edge = ((50, 0, 50), (50, 100, 50))
+
+        # Left face: eave at z=0
+        face1_vertices = [
+            (0, 0, 0),      # Below ridge
+            (0, 100, 0),    # Below ridge
+            (50, 100, 50),  # On ridge
+            (50, 0, 50),    # On ridge
+        ]
+        # Right face: eave at z=0
+        face2_vertices = [
+            (50, 0, 50),    # On ridge
+            (50, 100, 50),  # On ridge
+            (100, 100, 0),  # Below ridge
+            (100, 0, 0),    # Below ridge
+        ]
+
+        result = classify_roof_intersection(face1_vertices, face2_vertices, shared_edge)
+
+        assert result['classification'] == 'ridge'
+        assert result['confidence'] == 'high'
+
+    def test_valley_classification(self):
+        """Valley: non-shared vertices are ABOVE the shared edge"""
+        # Shared edge at z=0 (the valley)
+        shared_edge = ((50, 0, 0), (50, 100, 0))
+
+        # Left face: ridge at z=50
+        face1_vertices = [
+            (0, 0, 50),     # Above valley
+            (0, 100, 50),   # Above valley
+            (50, 100, 0),   # On valley
+            (50, 0, 0),     # On valley
+        ]
+        # Right face: ridge at z=50
+        face2_vertices = [
+            (50, 0, 0),     # On valley
+            (50, 100, 0),   # On valley
+            (100, 100, 50), # Above valley
+            (100, 0, 50),   # Above valley
+        ]
+
+        result = classify_roof_intersection(face1_vertices, face2_vertices, shared_edge)
+
+        assert result['classification'] == 'valley'
+        assert result['confidence'] == 'high'
+
+
+class TestDihedralAngle:
+    """Tests for calculate_dihedral_angle()"""
+
+    def test_perpendicular_normals(self):
+        """90° angle between normals"""
+        normal1 = (1, 0, 0)
+        normal2 = (0, 1, 0)
+
+        result = calculate_dihedral_angle(normal1, normal2)
+
+        assert abs(result['angle_degrees'] - 90) < 0.1
+        assert abs(result['trim_angle_degrees'] - 45) < 0.1
+
+    def test_45_degree_angle(self):
+        """45° angle between normals"""
+        normal1 = (1, 0, 0)
+        normal2 = (0.707, 0.707, 0)  # 45° from normal1
+
+        result = calculate_dihedral_angle(normal1, normal2)
+
+        assert abs(result['angle_degrees'] - 45) < 1
+        assert abs(result['trim_angle_degrees'] - 22.5) < 0.5
+
+    def test_parallel_normals(self):
+        """0° angle (parallel normals)"""
+        normal1 = (0, 0, 1)
+        normal2 = (0, 0, 1)
+
+        result = calculate_dihedral_angle(normal1, normal2)
+
+        assert result['angle_degrees'] < 0.1
+        assert result['trim_angle_degrees'] < 0.1
+
+
+class TestAnalyzeRoofIntersection:
+    """Integration tests for analyze_roof_intersection()"""
+
+    def test_complete_ridge_analysis(self):
+        """Full analysis of a ridge intersection"""
+        # Left roof face
+        face1_vertices = [
+            (0, 0, 0),
+            (0, 100, 0),
+            (50, 100, 50),
+            (50, 0, 50),
+        ]
+        face1_normal = (0.707, 0, 0.707)
+        face1_edges = [
+            ((0, 0, 0), (0, 100, 0)),
+            ((0, 100, 0), (50, 100, 50)),
+            ((50, 100, 50), (50, 0, 50)),
+            ((50, 0, 50), (0, 0, 0)),
+        ]
+
+        # Right roof face
+        face2_vertices = [
+            (50, 0, 50),
+            (50, 100, 50),
+            (100, 100, 0),
+            (100, 0, 0),
+        ]
+        face2_normal = (-0.707, 0, 0.707)
+        face2_edges = [
+            ((50, 0, 50), (50, 100, 50)),
+            ((50, 100, 50), (100, 100, 0)),
+            ((100, 100, 0), (100, 0, 0)),
+            ((100, 0, 0), (50, 0, 50)),
+        ]
+
+        result = analyze_roof_intersection(
+            face1_vertices, face1_normal, face1_edges,
+            face2_vertices, face2_normal, face2_edges
+        )
+
+        assert result['has_shared_edge'] is True
+        assert result['classification'] == 'ridge'
+        assert 'RIDGE' in result['trim_recommendation']
 
 
 if __name__ == '__main__':
