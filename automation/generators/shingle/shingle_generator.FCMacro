@@ -555,52 +555,49 @@ def generate_shingles(face, base_object, params):
             v_scaled = scale_vector(v_vec, v)
             top_position = origin + u_scaled + v_scaled
             
+            # Build rotation matrix from target coordinate system
+            # Shingle local coords: X=width, Y=height(down slope), Z=thickness(outward)
+            # Target coords: U=across, V=up slope, Normal=outward
+            # So: local X -> U, local Y -> V, local Z -> Normal
+            rotation_matrix = App.Matrix(
+                u_vec.x, v_vec.x, normal.x, 0,
+                u_vec.y, v_vec.y, normal.y, 0,
+                u_vec.z, v_vec.z, normal.z, 0,
+                0, 0, 0, 1
+            )
+            final_rotation = App.Rotation(rotation_matrix)
+
             # Create shingle geometry based on row
             if row == 0:
                 # Row 0: Rectangular box with exposed height only
                 shingle_shape = Part.makeBox(shingle_width, exposure, shingle_thickness)
-                
-                # Align to face
-                z_axis = App.Vector(0, 0, 1)
-                rot1 = App.Rotation(z_axis, normal)
-                x_after_rot1 = rot1.multVec(App.Vector(1, 0, 0))
-                rot2 = App.Rotation(x_after_rot1, u_vec)
-                final_rotation = rot2.multiply(rot1)
-                
                 shingle_shape.Placement = App.Placement(top_position, final_rotation)
-                
+
             else:
                 # Row 1+: Triangular wedge cross-section
                 # Top edge: thin (wedge_thickness) against roof
                 # Bottom edge: tapers to a point
                 # Height: full shingle_height
-                
+
                 p1 = App.Vector(0, 0, 0)                      # Top back (against roof, uphill)
-                p2 = App.Vector(0, 0, wedge_thickness)        # Top front (visible surface, uphill)  
+                p2 = App.Vector(0, 0, wedge_thickness)        # Top front (visible surface, uphill)
                 p3 = App.Vector(0, shingle_height, 0)         # Bottom point (tapers to roof surface)
-                
+
                 # Create edges connecting the points
                 l1 = Part.LineSegment(p1, p2)
                 l2 = Part.LineSegment(p2, p3)
                 l3 = Part.LineSegment(p3, p1)
-                
+
                 # Make wire from edges
                 profile_wire = Part.Wire([l1.toShape(), l2.toShape(), l3.toShape()])
-                
+
                 # Create face from wire
                 profile_face = Part.Face(profile_wire)
-                
+
                 # Extrude along shingle width
                 extrude_vector = App.Vector(shingle_width, 0, 0)
                 shingle_shape = profile_face.extrude(extrude_vector)
-                
-                # Position and orient on the roof
-                z_axis = App.Vector(0, 0, 1)
-                rot1 = App.Rotation(z_axis, normal)
-                x_after_rot1 = rot1.multVec(App.Vector(1, 0, 0))
-                rot2 = App.Rotation(x_after_rot1, u_vec)
-                final_rotation = rot2.multiply(rot1)
-                
+
                 shingle_shape.Placement = App.Placement(top_position, final_rotation)
             
             # Clip shingle to face boundary if clipping volume exists

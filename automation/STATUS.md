@@ -8,9 +8,9 @@
 
 | Utility | Version | Purpose |
 |---------|---------|---------|
-| skeleton_lint.FCMacro | v1.1.0 | Validate parameters in models descended from Skeleton |
+| lint_params.FCMacro | v1.2.0 | Validate parameters in models descended from Skeleton |
 
-### skeleton_lint.FCMacro
+### lint_params.FCMacro
 Validates spreadsheet parameters before export/printing. Checks:
 - Scaled parameters smaller than `materialThickness` (highlights in orange)
 

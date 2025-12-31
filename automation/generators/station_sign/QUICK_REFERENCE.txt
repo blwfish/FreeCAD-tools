@@ -1,0 +1,82 @@
+═══════════════════════════════════════════════════════════════
+  STATION SIGN GENERATOR v1.2.0 - QUICK REFERENCE
+═══════════════════════════════════════════════════════════════
+
+INSTALLATION
+───────────────────────────────────────────────────────────────
+  cd station_sign_generator
+  python3 freecad_installer.py
+
+USAGE
+───────────────────────────────────────────────────────────────
+  1. Create any object (box, sketch, etc.)
+  2. Set Label to station name: obj.Label = "Gordonsville"
+  3. Select the object
+  4. Run: Macro → station_sign_generator
+
+PARAMETERS (Defaults)
+───────────────────────────────────────────────────────────────
+  Material thickness:      0.2mm  (3D print layer height)
+  Border thickness:        0.5mm  (1/9 of letter height)
+  Gap horizontal (L/R):    1.5mm  (generous per C&O photo)
+  Gap vertical (T/B):      0.75mm (tighter per C&O photo)
+
+SIGN DIMENSIONS
+───────────────────────────────────────────────────────────────
+  Width  = 1.0 + 3.0 + text_width  = border + gaps + text
+  Height = 1.0 + 1.5 + text_height = border + gaps + text
+  
+  Total thickness: 0.8mm (0.4 bg + 0.2 border + 0.2 text)
+
+SPREADSHEET SUPPORT
+───────────────────────────────────────────────────────────────
+  If spreadsheet "Skeleton" exists, reads from:
+    B2: materialThickness
+    B3: borderThickness
+    B4: borderGapHorizontal
+    B5: borderGapVertical
+
+GIT DEPLOYMENT
+───────────────────────────────────────────────────────────────
+  python3 git_populate.py
+  git commit -m "Add station sign generator v1.2.0"
+  git push
+
+FILE STRUCTURE
+───────────────────────────────────────────────────────────────
+  station_sign_generator/
+  ├── station_sign_generator.FCMacro  ← Main macro (no version!)
+  ├── freecad_installer.py            ← Auto-installer
+  ├── git_populate.py                 ← Git helper
+  ├── README.md                       ← Full docs
+  └── VERSION                         ← Version: 1.2.0
+
+EXAMPLE: GORDONSVILLE
+───────────────────────────────────────────────────────────────
+  Text:   ~35mm × 4.67mm (11 letters, 16" at full scale)
+  Sign:   ~39mm × 7.17mm (with borders and gaps)
+  Ratio:  ~5.4:1 (elongated horizontal - matches prototype)
+
+METADATA PROPERTIES
+───────────────────────────────────────────────────────────────
+  Generated objects include:
+    GeneratorName, GeneratorVersion
+    StationName, TextHeightHO
+    SignWidth, SignHeight
+    BorderThickness, BorderGapHorizontal, BorderGapVertical
+
+FONT
+───────────────────────────────────────────────────────────────
+  Looks for: ~/Documents/FreeCAD-github/Station-font-AV-20-219.ttf
+  Falls back to system default if not found
+
+TROUBLESHOOTING
+───────────────────────────────────────────────────────────────
+  • No object selected: Select object with Label set
+  • Font not found: Uses system font (still works)
+  • ShapeString visible: Should auto-hide/remove (v1.2.0 fix)
+  • Wrong proportions: Check H/V gap parameters
+
+═══════════════════════════════════════════════════════════════
+  Ready for production! Part of COVA layout automation suite.
+═══════════════════════════════════════════════════════════════

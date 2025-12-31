@@ -1,5 +1,5 @@
 """
-Skeleton Lint v1.1.0
+Lint Params v1.2.0
 Validates parameters in models descended from Skeleton.FCStd.
 
 Works on any FreeCAD document that has a 'params' spreadsheet with the
@@ -21,8 +21,8 @@ Date: 2025-12-31
 
 import FreeCAD as App
 
-VERSION = "1.1.0"
-MACRO_NAME = "skeleton_lint"
+VERSION = "1.2.0"
+MACRO_NAME = "lint_params"
 
 # Colors (R, G, B) in 0.0-1.0 range
 COLOR_WARNING = (1.0, 0.8, 0.0)  # Orange/yellow for warnings
@@ -207,7 +207,7 @@ def clear_previous_highlights(ss, data_rows):
 def run_lint():
     """Main lint function."""
     App.Console.PrintMessage(f"\n{'='*60}\n")
-    App.Console.PrintMessage(f"Skeleton Lint v{VERSION}\n")
+    App.Console.PrintMessage(f"Lint Params v{VERSION}\n")
     App.Console.PrintMessage(f"{'='*60}\n\n")
 
     # Get active document
