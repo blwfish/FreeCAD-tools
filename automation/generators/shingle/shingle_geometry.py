@@ -566,23 +566,75 @@ def calculate_upslope_direction(vertices: List[Tuple[float, float, float]],
 
 def calculate_across_roof_direction(vertices: List[Tuple[float, float, float]],
                                      upslope: Tuple[float, float, float],
-                                     face_normal: Tuple[float, float, float]) -> Tuple[float, float, float]:
+                                     face_normal: Tuple[float, float, float],
+                                     eave_vertices: List[Tuple[float, float, float]] = None) -> Tuple[float, float, float]:
     """
-    Calculate the unit vector pointing across the roof (perpendicular to upslope).
+    Calculate the unit vector pointing across the roof (parallel to eave edge).
 
-    Uses cross product of upslope and face normal to get the horizontal
-    direction along the roof surface.
+    Uses the actual eave edge direction when available, falling back to
+    cross product method if eave has only one vertex.
 
     Args:
         vertices: List of (x, y, z) tuples (used for context, not calculation)
         upslope: Unit vector pointing up the slope
         face_normal: Unit vector normal to the face
+        eave_vertices: List of vertices at the eave level (lowest Z)
 
     Returns:
         Tuple (x, y, z) unit vector pointing across the roof (U direction)
     """
+    # Primary method: use the eave edge direction directly
+    # This ensures U is truly horizontal along the eave, not a computed perpendicular
+    if eave_vertices and len(eave_vertices) >= 2:
+        # Find two eave vertices that are furthest apart (the eave edge endpoints)
+        max_dist = 0
+        best_pair = (eave_vertices[0], eave_vertices[1]) if len(eave_vertices) >= 2 else None
+
+        for i, v1 in enumerate(eave_vertices):
+            for v2 in eave_vertices[i+1:]:
+                dx = v2[0] - v1[0]
+                dy = v2[1] - v1[1]
+                dz = v2[2] - v1[2]
+                dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+                if dist > max_dist:
+                    max_dist = dist
+                    best_pair = (v1, v2)
+
+        if best_pair and max_dist > 0.001:
+            v1, v2 = best_pair
+            ux = v2[0] - v1[0]
+            uy = v2[1] - v1[1]
+            uz = v2[2] - v1[2]
+
+            # Normalize
+            length = math.sqrt(ux*ux + uy*uy + uz*uz)
+            if length > 0.001:
+                u_candidate = (ux / length, uy / length, uz / length)
+
+                # Establish canonical direction: U should point in a consistent
+                # "positive" direction. We define this as:
+                # 1. If eave runs mainly in Y, U should point +Y
+                # 2. If eave runs mainly in X, U should point +X
+                # This ensures both sides of a gable roof have shingles
+                # laid out in the same direction along the eave.
+
+                # Find which horizontal axis the eave primarily runs along
+                abs_x = abs(u_candidate[0])
+                abs_y = abs(u_candidate[1])
+
+                if abs_y >= abs_x:
+                    # Eave runs mainly in Y direction - ensure +Y
+                    if u_candidate[1] < 0:
+                        u_candidate = (-u_candidate[0], -u_candidate[1], -u_candidate[2])
+                else:
+                    # Eave runs mainly in X direction - ensure +X
+                    if u_candidate[0] < 0:
+                        u_candidate = (-u_candidate[0], -u_candidate[1], -u_candidate[2])
+
+                return u_candidate
+
+    # Fallback: cross product method (for single-point eaves or degenerate cases)
     # Cross product: normal × upslope gives across direction
-    # (right-hand rule: if normal points out and upslope points up, across points right)
     ux = face_normal[1] * upslope[2] - face_normal[2] * upslope[1]
     uy = face_normal[2] * upslope[0] - face_normal[0] * upslope[2]
     uz = face_normal[0] * upslope[1] - face_normal[1] * upslope[0]
@@ -627,27 +679,31 @@ def get_roof_coordinate_system(vertices: List[Tuple[float, float, float]],
     # Calculate upslope direction (V)
     v_vec = calculate_upslope_direction(vertices, z_tolerance)
 
-    # Calculate across direction (U)
-    u_vec = calculate_across_roof_direction(vertices, v_vec, face_normal)
+    # Calculate across direction (U) - using actual eave edge direction
+    u_vec = calculate_across_roof_direction(vertices, v_vec, face_normal,
+                                            eave_vertices=eave_ridge['eave_vertices'])
 
-    # Verify/correct normal direction
-    # The normal should be consistent with U × V (right-hand rule)
-    expected_normal = (
+    # Verify coordinate system handedness
+    # U × V should point in the same direction as face_normal (outward)
+    # If not, flip U to make it so (preserving the outward normal)
+    cross = (
         u_vec[1] * v_vec[2] - u_vec[2] * v_vec[1],
         u_vec[2] * v_vec[0] - u_vec[0] * v_vec[2],
         u_vec[0] * v_vec[1] - u_vec[1] * v_vec[0]
     )
 
-    # Check if face_normal agrees with expected_normal
-    dot = (face_normal[0] * expected_normal[0] +
-           face_normal[1] * expected_normal[1] +
-           face_normal[2] * expected_normal[2])
+    # Check if U × V agrees with face_normal direction
+    dot = (face_normal[0] * cross[0] +
+           face_normal[1] * cross[1] +
+           face_normal[2] * cross[2])
 
     if dot < 0:
-        # Normal is flipped - use corrected version
-        corrected_normal = expected_normal
-    else:
-        corrected_normal = face_normal
+        # U × V points inward - flip U to fix handedness
+        # This keeps the face_normal (outward) and V (upslope) correct
+        u_vec = (-u_vec[0], -u_vec[1], -u_vec[2])
+
+    # Use the original face_normal (it points outward from the geometry)
+    corrected_normal = face_normal
 
     # Find origin: prefer corner vertex (2 edges) at lowest Z
     # For now, just use the first eave vertex

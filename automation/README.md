@@ -13,13 +13,13 @@ Parametric generators for model railroading in FreeCAD. All generators create ph
 
 | Utility | Purpose |
 |---------|---------|
-| [skeleton_lint.FCMacro](skeleton_lint.FCMacro) | Validate parameters before export/printing |
+| [lint_params.FCMacro](lint_params.FCMacro) | Validate parameters before export/printing |
 
-### skeleton_lint
+### lint_params
 Checks scaled parameters against `materialThickness` to catch unprintable dimensions:
 ```
 1. Open any model with a 'params' spreadsheet
-2. Run skeleton_lint.FCMacro
+2. Run lint_params.FCMacro
 3. Orange-highlighted cells indicate values below materialThickness
 ```
 
