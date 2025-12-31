@@ -1,0 +1,283 @@
+"""
+Skeleton Lint v1.1.0
+Validates parameters in models descended from Skeleton.FCStd.
+
+Works on any FreeCAD document that has a 'params' spreadsheet with the
+standard Skeleton structure (Scaled Parameters section, materialThickness, etc.)
+
+Checks:
+1. Scaled parameters smaller than materialThickness (unprintable at current settings)
+   - Highlights the Parameter cell (column D) with orange background
+
+Usage:
+1. Open any model with a 'params' spreadsheet (Skeleton or descendant)
+2. Run this macro
+3. Check the Report View for details
+4. Orange cells in the Parameter column indicate values below materialThickness
+
+Author: Brian White (with Claude assistance)
+Date: 2025-12-31
+"""
+
+import FreeCAD as App
+
+VERSION = "1.1.0"
+MACRO_NAME = "skeleton_lint"
+
+# Colors (R, G, B) in 0.0-1.0 range
+COLOR_WARNING = (1.0, 0.8, 0.0)  # Orange/yellow for warnings
+COLOR_CLEAR = (1.0, 1.0, 1.0)  # White to clear/reset background
+
+def find_spreadsheet(doc):
+    """Find the params spreadsheet by label or common names."""
+    # Try by label first
+    for obj in doc.Objects:
+        if obj.TypeId == 'Spreadsheet::Sheet':
+            if obj.Label.lower() in ['params', 'parameters', 'skeleton']:
+                return obj
+
+    # Try by object name
+    for name in ['Spreadsheet', 'params', 'Skeleton']:
+        obj = doc.getObject(name)
+        if obj and obj.TypeId == 'Spreadsheet::Sheet':
+            return obj
+
+    return None
+
+
+def get_section_bounds(ss):
+    """
+    Find the row bounds of the Scaled Parameters section.
+    Returns (start_row, end_row) where data rows are between them.
+    """
+    start_row = None
+    end_row = None
+
+    # Scan column A for section markers
+    for row in range(1, 200):  # Allow for longer spreadsheets
+        cell = f"A{row}"
+        try:
+            val = ss.get(cell)
+            if val is None:
+                continue
+            val_str = str(val).strip()
+
+            if val_str == "Scaled Parameters":
+                start_row = row
+            elif val_str.startswith("=== SCALE REFERENCE"):
+                end_row = row
+                break
+        except:
+            continue
+
+    return start_row, end_row
+
+
+def find_data_rows(ss, start_row, end_row):
+    """
+    Find all rows in the Scaled Parameters section that have actual data.
+    A data row has both a Parameter (column D) and Scale Size (column E) value.
+
+    Returns list of row numbers containing data.
+    """
+    data_rows = []
+
+    # Header is at start_row + 1, data starts at start_row + 2
+    for row in range(start_row + 2, end_row):
+        try:
+            param_val = ss.get(f"D{row}")
+            scale_val = ss.get(f"E{row}")
+
+            # Both must have values to be a data row
+            if param_val is not None and scale_val is not None:
+                data_rows.append(row)
+        except:
+            # Cell doesn't exist - skip
+            continue
+
+    return data_rows
+
+
+def get_material_thickness(ss):
+    """Get materialThickness from spreadsheet, trying alias first then known cells."""
+    # Try by alias
+    cells = ss.getUsedCells()
+    for cell in cells:
+        try:
+            alias = ss.getAlias(cell)
+            if alias == 'materialThickness':
+                return float(ss.get(cell))
+        except:
+            continue
+
+    # Fallback to known location
+    try:
+        return float(ss.get('B4'))
+    except:
+        return None
+
+
+def parse_numeric_value(value):
+    """Extract numeric value from cell, handling units like '9.63 mm'."""
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    # String with possible units
+    val_str = str(value).strip()
+
+    # Remove common units
+    for unit in [' mm', 'mm', ' in', 'in', ' "', '"']:
+        val_str = val_str.replace(unit, '')
+
+    try:
+        return float(val_str)
+    except ValueError:
+        return None
+
+
+def lint_scaled_parameters(ss, material_thickness, data_rows):
+    """
+    Check scaled parameters section for values below materialThickness.
+
+    Args:
+        ss: Spreadsheet object
+        material_thickness: Threshold value in mm
+        data_rows: List of row numbers containing data
+
+    Returns list of (cell, param_name, value, threshold) tuples for warnings.
+    """
+    warnings = []
+
+    for row in data_rows:
+        param_cell = f"D{row}"
+        value_cell = f"E{row}"
+
+        try:
+            param_name = ss.get(param_cell)
+            value = ss.get(value_cell)
+
+            # Parse numeric value
+            numeric_value = parse_numeric_value(value)
+            if numeric_value is None:
+                continue
+
+            # Check against threshold
+            if numeric_value < material_thickness:
+                warnings.append((param_cell, param_name, numeric_value, material_thickness))
+        except Exception as e:
+            App.Console.PrintWarning(f"  Skipping row {row}: {e}\n")
+
+    return warnings
+
+
+def apply_warning_highlights(ss, warnings):
+    """Apply orange background to warning cells."""
+    for param_cell, param_name, value, threshold in warnings:
+        ss.setBackground(param_cell, COLOR_WARNING)
+
+
+def is_warning_color(bg):
+    """Check if background color matches our warning color."""
+    if bg is None:
+        return False
+    # Handle both 3-tuple and 4-tuple (with alpha) formats
+    if len(bg) >= 3:
+        r, g, b = bg[0], bg[1], bg[2]
+        wr, wg, wb = COLOR_WARNING
+        # Allow small tolerance for float comparison
+        return (abs(r - wr) < 0.01 and abs(g - wg) < 0.01 and abs(b - wb) < 0.01)
+    return False
+
+
+def clear_previous_highlights(ss, data_rows):
+    """Clear any previous warning highlights in the Parameter column."""
+    for row in data_rows:
+        param_cell = f"D{row}"
+        try:
+            current_bg = ss.getBackground(param_cell)
+            if is_warning_color(current_bg):
+                ss.setBackground(param_cell, COLOR_CLEAR)
+        except:
+            pass
+
+
+def run_lint():
+    """Main lint function."""
+    App.Console.PrintMessage(f"\n{'='*60}\n")
+    App.Console.PrintMessage(f"Skeleton Lint v{VERSION}\n")
+    App.Console.PrintMessage(f"{'='*60}\n\n")
+
+    # Get active document
+    doc = App.ActiveDocument
+    if doc is None:
+        App.Console.PrintError("No active document. Open a model with a params spreadsheet.\n")
+        return
+
+    App.Console.PrintMessage(f"Document: {doc.Label} ({doc.Name})\n")
+
+    # Find spreadsheet
+    ss = find_spreadsheet(doc)
+    if ss is None:
+        App.Console.PrintError("No params spreadsheet found.\n")
+        return
+
+    App.Console.PrintMessage(f"Spreadsheet: {ss.Label} ({ss.Name})\n\n")
+
+    # Get materialThickness
+    material_thickness = get_material_thickness(ss)
+    if material_thickness is None:
+        App.Console.PrintError("Could not find materialThickness parameter.\n")
+        return
+
+    App.Console.PrintMessage(f"materialThickness = {material_thickness} mm\n\n")
+
+    # Find scaled parameters section
+    start_row, end_row = get_section_bounds(ss)
+    if start_row is None or end_row is None:
+        App.Console.PrintError("Could not find Scaled Parameters section bounds.\n")
+        return
+
+    # Find actual data rows (rows with both Parameter and Scale Size values)
+    data_rows = find_data_rows(ss, start_row, end_row)
+    if not data_rows:
+        App.Console.PrintMessage("No data rows found in Scaled Parameters section.\n")
+        return
+
+    App.Console.PrintMessage(f"Scaled Parameters section: {len(data_rows)} parameters (rows {data_rows[0]}-{data_rows[-1]})\n\n")
+
+    # Clear previous highlights
+    clear_previous_highlights(ss, data_rows)
+
+    # Run lint checks
+    App.Console.PrintMessage("Checking for values below materialThickness...\n")
+    warnings = lint_scaled_parameters(ss, material_thickness, data_rows)
+
+    if warnings:
+        App.Console.PrintWarning(f"\nFound {len(warnings)} warning(s):\n")
+        for param_cell, param_name, value, threshold in warnings:
+            App.Console.PrintWarning(
+                f"  {param_cell}: '{param_name}' = {value:.4f} mm < {threshold} mm\n"
+            )
+
+        # Apply highlights
+        apply_warning_highlights(ss, warnings)
+        App.Console.PrintMessage(f"\nHighlighted {len(warnings)} cell(s) in orange.\n")
+    else:
+        App.Console.PrintMessage("\nNo warnings. All scaled parameters are >= materialThickness.\n")
+
+    # Recompute to show changes
+    doc.recompute()
+
+    App.Console.PrintMessage(f"\n{'='*60}\n")
+    App.Console.PrintMessage("Lint complete.\n")
+    App.Console.PrintMessage(f"{'='*60}\n\n")
+
+
+# Run when executed as macro
+# Note: __name__ is "__main__" when run from FreeCAD Macro menu,
+# but "builtins" when run via exec() from MCP execute_python
+if __name__ == "__main__" or __name__ == "builtins":
+    run_lint()
