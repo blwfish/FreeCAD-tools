@@ -36,26 +36,33 @@ import sys
 import os
 
 # Try to import the geometry library
-# First try _lib/ subdirectory (standard installation location)
-# Then try same directory (fallback for manual installation)
+# Force fresh import every time to pick up code changes
+import importlib
+
+# Remove any cached brick_geometry module to force fresh load
+if 'brick_geometry' in sys.modules:
+    del sys.modules['brick_geometry']
+
+# Add macro directory to path if needed
+macro_dir = os.path.dirname(__file__)
+if macro_dir not in sys.path:
+    sys.path.insert(0, macro_dir)
+
+# Also check _lib subdirectory
+lib_dir = os.path.join(macro_dir, '_lib')
+if lib_dir not in sys.path:
+    sys.path.insert(0, lib_dir)
+
 try:
+    import brick_geometry
     from brick_geometry import BrickGeometry
-except ImportError:
-    # Try adding _lib to path
-    import sys
-    macro_dir = os.path.dirname(__file__)
-    lib_dir = os.path.join(macro_dir, '_lib')
-    if lib_dir not in sys.path:
-        sys.path.insert(0, lib_dir)
-    
-    try:
-        from brick_geometry import BrickGeometry
-    except ImportError:
-        print("ERROR: Could not import brick_geometry module")
-        print(f"Looked in: {macro_dir}")
-        print(f"Looked in: {lib_dir}")
-        print("Make sure brick_geometry.py is in _lib/ subdirectory or same directory as macro")
-        sys.exit(1)
+    print(f"Loaded brick_geometry v{getattr(brick_geometry, '__version__', 'unknown')} from {brick_geometry.__file__}")
+except ImportError as e:
+    print(f"ERROR: Could not import brick_geometry module: {e}")
+    print(f"Looked in: {macro_dir}")
+    print(f"Looked in: {lib_dir}")
+    print("Make sure brick_geometry.py is in _lib/ subdirectory or same directory as macro")
+    sys.exit(1)
 
 
 def detect_openings_and_create_punchout(face, origin, u_vec, v_vec, normal, brick_depth):
@@ -153,10 +160,13 @@ def detect_openings_and_create_punchout(face, origin, u_vec, v_vec, normal, bric
 def snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar):
     """
     Snap face origin to global 3D grid to align brick courses across all faces.
-    
+
     This ensures that brick courses and columns align perfectly across coplanar faces,
     eliminating visible seams at face boundaries.
-    
+
+    IMPORTANT: Only snaps along the wall plane (u and v directions), NOT along the
+    normal direction. This preserves the origin's position on the wall surface.
+
     Args:
         origin: Face origin point (FreeCAD.Vector)
         u_vec: Horizontal direction vector (normalized)
@@ -164,42 +174,43 @@ def snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, 
         brick_width: Brick width in mm
         brick_height: Brick height in mm
         mortar: Mortar thickness in mm
-        
+
     Returns:
         Snapped origin point (FreeCAD.Vector)
     """
     # Grid spacings
     horizontal_grid = brick_width + mortar  # e.g., 2.43mm for stretcher bond
     vertical_grid = brick_height + mortar    # e.g., 0.76mm
-    
-    # Global axes
-    global_x = App.Vector(1, 0, 0)
-    global_y = App.Vector(0, 1, 0)
-    global_z = App.Vector(0, 0, 1)
-    
-    # Project origin onto global axes
-    origin_x = origin.dot(global_x)
-    origin_y = origin.dot(global_y)
-    origin_z = origin.dot(global_z)
-    
-    # Snap to grid
-    snapped_x = round(origin_x / horizontal_grid) * horizontal_grid
-    snapped_y = round(origin_y / horizontal_grid) * horizontal_grid
-    snapped_z = round(origin_z / vertical_grid) * vertical_grid
-    
+
+    # Calculate normal as cross product of u and v
+    normal = u_vec.cross(v_vec)
+    normal.normalize()
+
+    # Project origin onto wall-aligned axes
+    origin_u = origin.dot(u_vec)  # Position along horizontal wall direction
+    origin_v = origin.dot(v_vec)  # Position along vertical wall direction
+    origin_n = origin.dot(normal) # Position along normal (preserve this!)
+
+    # Snap only u and v to grid, keep normal component unchanged
+    snapped_u = round(origin_u / horizontal_grid) * horizontal_grid
+    snapped_v = round(origin_v / vertical_grid) * vertical_grid
+
     # Reconstruct snapped origin
-    snapped_origin = App.Vector(snapped_x, snapped_y, snapped_z)
-    
-    # Calculate adjustment
-    adjustment = snapped_origin - origin
-    adjustment_distance = adjustment.Length
-    
+    snapped_origin = (scale_vector(u_vec, snapped_u) +
+                      scale_vector(v_vec, snapped_v) +
+                      scale_vector(normal, origin_n))
+
+    # Calculate adjustment (only in wall plane)
+    adjustment_u = snapped_u - origin_u
+    adjustment_v = snapped_v - origin_v
+    adjustment_distance = math.sqrt(adjustment_u**2 + adjustment_v**2)
+
     if adjustment_distance > 0.001:  # Only report if meaningful adjustment
-        print(f"  Grid snapping: adjusted origin by {adjustment_distance:.3f}mm")
-        print(f"    X: {origin_x:.3f} → {snapped_x:.3f} mm")
-        print(f"    Y: {origin_y:.3f} → {snapped_y:.3f} mm")
-        print(f"    Z: {origin_z:.3f} → {snapped_z:.3f} mm")
-    
+        print(f"  Grid snapping: adjusted origin by {adjustment_distance:.3f}mm (in wall plane)")
+        print(f"    U (horizontal): {origin_u:.3f} → {snapped_u:.3f} mm")
+        print(f"    V (vertical): {origin_v:.3f} → {snapped_v:.3f} mm")
+        print(f"    Normal: {origin_n:.3f} mm (unchanged)")
+
     return snapped_origin
 
 
@@ -312,24 +323,28 @@ def create_brick_segments(u_length, bay_boundaries):
 
 
 def generate_segmented_bricks(u_length, v_length, brick_width, brick_height, brick_depth,
-                              mortar, bond_type, common_bond_count, bay_boundaries):
+                              mortar, bond_type, common_bond_count, bay_boundaries,
+                              skin_depth=None):
     """
     Generate bricks with optional bay segmentation.
-    
+
+    Args:
+        skin_depth: Rendered brick depth (defaults to brick_depth if not specified)
+
     Returns:
         Tuple of (brick_defs, metadata)
     """
     # Create segments if boundaries exist
     segments = create_brick_segments(u_length, bay_boundaries)
     print(f"Generating {len(segments)} segment(s)")
-    
+
     all_brick_defs = []
     total_metadata = {'num_courses': 0, 'bond_type': bond_type}
-    
+
     for seg_idx, (seg_start, seg_end, seg_width) in enumerate(segments):
         if len(segments) > 1:
             print(f"  Segment {seg_idx + 1}: u={seg_start:.1f} to {seg_end:.1f} (width={seg_width:.1f}mm)")
-        
+
         bg = BrickGeometry(
             u_length=seg_width,
             v_length=v_length,
@@ -338,7 +353,8 @@ def generate_segmented_bricks(u_length, v_length, brick_width, brick_height, bri
             brick_depth=brick_depth,
             mortar=mortar,
             bond_type=bond_type,
-            common_bond_count=common_bond_count
+            common_bond_count=common_bond_count,
+            skin_depth=skin_depth
         )
         
         result = bg.generate()
@@ -423,29 +439,47 @@ def get_face_coordinate_system(face):
         else:
             other_axes.append((rng, name, vec))
     
-    # v_vec should be the Z axis (vertical)
-    # u_vec should be the largest of the remaining axes (horizontal)
-    if z_axis:
-        v_vec = z_axis[2]
-        v_length = z_axis[0]
-        
-        # u_vec is the largest non-Z axis
-        u_vec = other_axes[0][2]
-        u_length = other_axes[0][0]
-    else:
-        # No Z variation? Wall is horizontal (unusual). Use the two largest.
-        u_vec = axes[0][2]
-        u_length = axes[0][0]
-        v_vec = axes[1][2]
-        v_length = axes[1][0]
-    
-    # Get face normal
+    # Get face normal first - we need this to determine which axes are on the face
     u_range = face.ParameterRange[:2]
     v_range = face.ParameterRange[2:]
     u_mid = (u_range[0] + u_range[1]) / 2
     v_mid = (v_range[0] + v_range[1]) / 2
     normal = face.normalAt(u_mid, v_mid)
-    
+
+    # v_vec should be the Z axis (vertical)
+    # u_vec should be the largest non-Z axis that is TANGENT to the face (perpendicular to normal)
+    if z_axis and z_axis[0] > 0.001:  # Has meaningful Z extent
+        v_vec = z_axis[2]
+        v_length = z_axis[0]
+
+        # u_vec is the largest non-Z axis that's tangent to the face
+        # Check each candidate axis - pick the one most perpendicular to normal
+        best_u_vec = None
+        best_u_length = 0
+        for rng, name, vec in other_axes:
+            dot = abs(vec.dot(normal))
+            # If dot product is small, this axis is tangent to the face
+            if dot < 0.5:  # More perpendicular to normal than parallel
+                if rng > best_u_length:
+                    best_u_vec = vec
+                    best_u_length = rng
+
+        if best_u_vec is None:
+            # Fallback: use the largest non-Z axis anyway
+            best_u_vec = other_axes[0][2]
+            best_u_length = other_axes[0][0]
+            print(f"  WARNING: Could not find axis tangent to face, using {other_axes[0][1]}")
+
+        u_vec = best_u_vec
+        u_length = best_u_length
+    else:
+        # No Z variation - face is horizontal (not a vertical wall)
+        raise ValueError(
+            "Selected face is horizontal (no Z extent).\n"
+            "The brick generator is designed for vertical wall faces.\n"
+            "Horizontal brick surfaces are not yet supported."
+        )
+
     return origin, u_vec, v_vec, normal, u_length, v_length
 
 
@@ -547,7 +581,8 @@ def get_params_from_spreadsheet(doc):
             'brick_depth': 'brickDepth',
             'mortar': 'mortar',
             'bond_type': 'bondType',
-            'common_bond_count': 'commonBondCount'
+            'common_bond_count': 'commonBondCount',
+            'material_thickness': 'materialThickness'
         }
         
         for param_key, cell_name in param_map.items():
@@ -612,7 +647,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     # Fill in defaults
                     brick_width = params.get('brick_width', 2.32)
                     brick_height = params.get('brick_height', 0.65)
-                    brick_depth = params.get('brick_depth', 1.09)
+                    brick_depth = params.get('brick_depth', 1.09)  # Used for header width calculation
+                    skin_depth = params.get('material_thickness', 0.3)  # Rendered brick thickness
                     mortar = params.get('mortar', 0.11)
                     bond_type = params.get('bond_type', 'stretcher')
                     common_bond_count = int(params.get('common_bond_count', 5))
@@ -622,7 +658,10 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     
                     # Snap origin to global grid for course alignment
                     origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar)
-                    
+
+                    # Bricks extrude outward along the normal from the wall surface
+                    # No origin offset needed - bricks start at wall surface
+
                     # Detect bay boundaries
                     print("Checking for bay boundaries...")
                     gap_threshold = 0.0005  # Half of typical fudgeFactor
@@ -646,7 +685,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     print("Generating geometry...")
                     brick_defs, metadata = generate_segmented_bricks(
                         u_length, v_length, brick_width, brick_height, brick_depth,
-                        mortar, bond_type, common_bond_count, bay_boundaries
+                        mortar, bond_type, common_bond_count, bay_boundaries,
+                        skin_depth=skin_depth
                     )
                     
                     print(f"Generated {len(brick_defs)} brick definitions")
@@ -658,7 +698,11 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     print("Creating FreeCAD geometry...")
                     brick_shapes = []
                     print(f"DEBUG: origin={origin}")
-                    print(f"DEBUG: u_vec={u_vec}, v_vec={v_vec}, normal={normal}")
+                    print(f"DEBUG: u_vec={u_vec} (horizontal along wall)")
+                    print(f"DEBUG: v_vec={v_vec} (vertical)")
+                    print(f"DEBUG: normal={normal} (perpendicular to wall)")
+                    print(f"DEBUG: u_length={u_length:.2f}mm, v_length={v_length:.2f}mm")
+                    print(f"DEBUG: u_vec dot normal = {u_vec.dot(normal):.4f} (should be ~0)")
                     for i, brick_def in enumerate(brick_defs):
                         brick = create_brick_from_def(brick_def, origin, u_vec, v_vec, normal)
                         brick_shapes.append(brick)
@@ -754,7 +798,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                 # Fill in defaults
                 brick_width = params.get('brick_width', 2.32)
                 brick_height = params.get('brick_height', 0.65)
-                brick_depth = params.get('brick_depth', 1.09)
+                brick_depth = params.get('brick_depth', 1.09)  # Used for header width calculation
+                skin_depth = params.get('material_thickness', 0.3)  # Rendered brick thickness
                 mortar = params.get('mortar', 0.11)
                 bond_type = params.get('bond_type', 'stretcher')
                 common_bond_count = int(params.get('common_bond_count', 5))
@@ -777,7 +822,16 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         
                         # Snap origin to global grid for course alignment
                         origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar)
-                        
+
+                        # Bricks extrude outward along the normal from the wall surface
+                        # No origin offset needed - bricks start at wall surface
+
+                        # Debug coordinate system
+                        print(f"  DEBUG: u_vec={u_vec} (horizontal along wall)")
+                        print(f"  DEBUG: v_vec={v_vec} (vertical)")
+                        print(f"  DEBUG: normal={normal} (perpendicular to wall)")
+                        print(f"  DEBUG: u_vec dot normal = {u_vec.dot(normal):.4f} (should be ~0)")
+
                         # Detect bay boundaries
                         print("Checking for bay boundaries...")
                         gap_threshold = 0.0005  # Half of typical fudgeFactor
@@ -794,7 +848,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         # Generate geometry with segmentation
                         brick_defs, metadata = generate_segmented_bricks(
                             u_length, v_length, brick_width, brick_height, brick_depth,
-                            mortar, bond_type, common_bond_count, bay_boundaries
+                            mortar, bond_type, common_bond_count, bay_boundaries,
+                            skin_depth=skin_depth
                         )
                         
                         print(f"  Generated {len(brick_defs)} brick definitions")
