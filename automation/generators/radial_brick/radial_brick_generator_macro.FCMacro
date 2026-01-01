@@ -1,0 +1,581 @@
+"""
+Radial Brick Generator Macro v1.0.0
+
+Generates running bond brick patterns on cylindrical and conical surfaces.
+Operates on selected faces from existing FreeCAD solids.
+
+Usage:
+1. Select one or more cylindrical or conical faces
+2. Run this macro
+3. Brick skin is generated and fused to the result
+
+Primary use cases: smokestacks, water towers, silos, grain elevators.
+
+Version: 1.0.0
+Date: 2025-01-01
+"""
+
+import FreeCAD as App
+import Part
+import math
+import sys
+import os
+
+# Try to import the geometry library
+try:
+    from radial_brick_geometry import RadialBrickGeometry, RadialBrickDef
+except ImportError:
+    # Try adding current directory to path
+    macro_dir = os.path.dirname(__file__)
+    if macro_dir not in sys.path:
+        sys.path.insert(0, macro_dir)
+
+    # Also try _lib subdirectory
+    lib_dir = os.path.join(macro_dir, '_lib')
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+
+    try:
+        from radial_brick_geometry import RadialBrickGeometry, RadialBrickDef
+    except ImportError:
+        print("ERROR: Could not import radial_brick_geometry module")
+        print(f"Looked in: {macro_dir}")
+        print(f"Looked in: {lib_dir}")
+        print("Make sure radial_brick_geometry.py is in the same directory as this macro")
+        sys.exit(1)
+
+
+# ============================================================================
+# FACE ANALYSIS
+# ============================================================================
+
+def analyze_cylindrical_face(face):
+    """
+    Analyze a cylindrical or conical face and extract its geometric properties.
+
+    Args:
+        face: FreeCAD face to analyze
+
+    Returns:
+        dict with:
+            'type': 'cylinder' or 'cone'
+            'axis': FreeCAD.Vector - axis of revolution
+            'center': FreeCAD.Vector - point on axis
+            'z_min': float - minimum Z coordinate
+            'z_max': float - maximum Z coordinate
+            'radius_at_z_min': float - radius at z_min
+            'radius_at_z_max': float - radius at z_max
+            'is_concave': bool - True if inner surface
+
+    Raises:
+        ValueError: If face is not cylindrical or conical
+    """
+    surface = face.Surface
+    surface_type = surface.TypeId
+
+    # Check for supported surface types
+    if surface_type == 'Part::GeomCylinder':
+        return _analyze_cylinder(face, surface)
+    elif surface_type == 'Part::GeomCone':
+        return _analyze_cone(face, surface)
+    elif surface_type == 'Part::GeomPlane':
+        raise ValueError(
+            "Selected face is planar.\n"
+            "Use brick_generator.py for flat walls.\n"
+            "radial_brick_generator.py requires cylindrical or conical surfaces."
+        )
+    else:
+        raise ValueError(
+            f"Selected face type '{surface_type}' is not supported.\n"
+            "radial_brick_generator.py requires cylindrical or conical surfaces.\n"
+            "Supported types: Part::GeomCylinder, Part::GeomCone"
+        )
+
+
+def _analyze_cylinder(face, surface):
+    """Analyze a cylindrical face."""
+    # Get cylinder properties
+    axis = surface.Axis
+    center = surface.Center
+    radius = surface.Radius
+
+    # Get Z bounds from face bounding box
+    bbox = face.BoundBox
+
+    # Determine if axis is vertical (Z-aligned)
+    z_axis = App.Vector(0, 0, 1)
+    axis_angle = math.degrees(axis.getAngle(z_axis))
+
+    # Allow for axis pointing up or down
+    if axis_angle > 90:
+        axis_angle = 180 - axis_angle
+
+    if axis_angle > 15:  # Tolerance in degrees
+        print(f"WARNING: Cylinder axis is {axis_angle:.1f} degrees from vertical")
+        print("         Results may not be as expected for non-vertical axes")
+
+    # Get Z range - for vertical cylinder, use bounding box Z
+    z_min = bbox.ZMin
+    z_max = bbox.ZMax
+
+    # Determine if concave by checking face normal direction
+    # Sample normal at center of face
+    u_range = face.ParameterRange[:2]
+    v_range = face.ParameterRange[2:]
+    u_mid = (u_range[0] + u_range[1]) / 2
+    v_mid = (v_range[0] + v_range[1]) / 2
+
+    try:
+        normal = face.normalAt(u_mid, v_mid)
+        # Get a point on the face
+        point = face.valueAt(u_mid, v_mid)
+        # Vector from axis to point
+        to_point = point - center
+        # Project onto plane perpendicular to axis
+        radial_dir = to_point - axis * (to_point.dot(axis))
+        radial_dir.normalize()
+
+        # If normal points toward axis, it's concave (inner surface)
+        is_concave = normal.dot(radial_dir) < 0
+    except:
+        is_concave = False
+
+    return {
+        'type': 'cylinder',
+        'axis': axis,
+        'center': center,
+        'z_min': z_min,
+        'z_max': z_max,
+        'radius_at_z_min': radius,
+        'radius_at_z_max': radius,
+        'is_concave': is_concave
+    }
+
+
+def _analyze_cone(face, surface):
+    """Analyze a conical face."""
+    # Get cone properties
+    axis = surface.Axis
+    apex = surface.Apex
+    semi_angle = surface.SemiAngle  # Radians
+
+    # Get Z bounds from face bounding box
+    bbox = face.BoundBox
+    z_min = bbox.ZMin
+    z_max = bbox.ZMax
+
+    # Determine if axis is vertical
+    z_axis = App.Vector(0, 0, 1)
+    axis_angle = math.degrees(axis.getAngle(z_axis))
+
+    if axis_angle > 90:
+        axis_angle = 180 - axis_angle
+
+    if axis_angle > 15:
+        print(f"WARNING: Cone axis is {axis_angle:.1f} degrees from vertical")
+        print("         Results may not be as expected for non-vertical axes")
+
+    # Calculate radius at z_min and z_max
+    # For a cone, radius = distance_from_apex * tan(semi_angle)
+    # Distance from apex along axis
+    apex_z = apex.z
+
+    # Handle axis direction (could point up or down)
+    if axis.z < 0:
+        # Axis points down, flip calculations
+        dist_min = apex_z - z_min
+        dist_max = apex_z - z_max
+    else:
+        dist_min = z_min - apex_z
+        dist_max = z_max - apex_z
+
+    radius_at_z_min = abs(dist_min * math.tan(semi_angle))
+    radius_at_z_max = abs(dist_max * math.tan(semi_angle))
+
+    # Determine if concave
+    u_range = face.ParameterRange[:2]
+    v_range = face.ParameterRange[2:]
+    u_mid = (u_range[0] + u_range[1]) / 2
+    v_mid = (v_range[0] + v_range[1]) / 2
+
+    try:
+        normal = face.normalAt(u_mid, v_mid)
+        point = face.valueAt(u_mid, v_mid)
+        # Vector from apex to point, projected onto XY plane
+        to_point = point - apex
+        radial_dir = to_point - axis * (to_point.dot(axis))
+        if radial_dir.Length > 0.001:
+            radial_dir.normalize()
+            is_concave = normal.dot(radial_dir) < 0
+        else:
+            is_concave = False
+    except:
+        is_concave = False
+
+    return {
+        'type': 'cone',
+        'axis': axis,
+        'center': apex,  # Use apex as reference point
+        'z_min': z_min,
+        'z_max': z_max,
+        'radius_at_z_min': radius_at_z_min,
+        'radius_at_z_max': radius_at_z_max,
+        'is_concave': is_concave
+    }
+
+
+# ============================================================================
+# GEOMETRY CREATION
+# ============================================================================
+
+def create_brick_solid(brick, geometry):
+    """
+    Create a FreeCAD solid from a RadialBrickDef.
+
+    Creates a wedge-shaped brick with curved inner and outer faces.
+
+    Args:
+        brick: RadialBrickDef with position and dimensions
+        geometry: RadialBrickGeometry instance for vertex calculations
+
+    Returns:
+        Part.Shape: Brick solid
+    """
+    # Get the 8 vertices
+    vertices = geometry.get_brick_vertices(brick)
+
+    # Convert to FreeCAD Vectors
+    pts = [App.Vector(v[0], v[1], v[2]) for v in vertices]
+
+    # Vertices are:
+    # 0-3: bottom face (inner-start, inner-end, outer-end, outer-start)
+    # 4-7: top face (inner-start, inner-end, outer-end, outer-start)
+
+    # Create edges
+    # Bottom face edges
+    e_b0 = Part.makeLine(pts[0], pts[1])  # inner bottom
+    e_b1 = Part.makeLine(pts[1], pts[2])  # end bottom
+    e_b2 = Part.makeLine(pts[2], pts[3])  # outer bottom
+    e_b3 = Part.makeLine(pts[3], pts[0])  # start bottom
+
+    # Top face edges
+    e_t0 = Part.makeLine(pts[4], pts[5])  # inner top
+    e_t1 = Part.makeLine(pts[5], pts[6])  # end top
+    e_t2 = Part.makeLine(pts[6], pts[7])  # outer top
+    e_t3 = Part.makeLine(pts[7], pts[4])  # start top
+
+    # Vertical edges
+    e_v0 = Part.makeLine(pts[0], pts[4])  # inner-start
+    e_v1 = Part.makeLine(pts[1], pts[5])  # inner-end
+    e_v2 = Part.makeLine(pts[2], pts[6])  # outer-end
+    e_v3 = Part.makeLine(pts[3], pts[7])  # outer-start
+
+    # Create faces
+    try:
+        # Bottom face
+        w_bottom = Part.Wire([e_b0, e_b1, e_b2, e_b3])
+        f_bottom = Part.Face(w_bottom)
+
+        # Top face
+        w_top = Part.Wire([e_t0, e_t1, e_t2, e_t3])
+        f_top = Part.Face(w_top)
+
+        # Inner face (facing axis)
+        w_inner = Part.Wire([e_b0, e_v1, e_t0, e_v0])
+        f_inner = Part.Face(w_inner)
+
+        # Outer face (facing away from axis)
+        w_outer = Part.Wire([e_b2, e_v3, e_t2, e_v2])
+        f_outer = Part.Face(w_outer)
+
+        # Start face
+        w_start = Part.Wire([e_b3, e_v0, e_t3, e_v3])
+        f_start = Part.Face(w_start)
+
+        # End face
+        w_end = Part.Wire([e_b1, e_v2, e_t1, e_v1])
+        f_end = Part.Face(w_end)
+
+        # Create shell and solid
+        shell = Part.Shell([f_bottom, f_top, f_inner, f_outer, f_start, f_end])
+        solid = Part.Solid(shell)
+
+        return solid
+
+    except Exception as e:
+        # If solid creation fails, return compound of faces
+        print(f"  Warning: Could not create solid brick, using faces: {e}")
+        try:
+            faces = [f_bottom, f_top, f_inner, f_outer, f_start, f_end]
+            return Part.Compound(faces)
+        except:
+            return None
+
+
+def create_brick_face_only(brick, geometry):
+    """
+    Create just the visible outer face of a brick.
+
+    This is more efficient for creating "skin" geometry.
+
+    Args:
+        brick: RadialBrickDef
+        geometry: RadialBrickGeometry instance
+
+    Returns:
+        Part.Face: The visible brick face
+    """
+    vertices = geometry.get_outer_face_vertices(brick)
+    pts = [App.Vector(v[0], v[1], v[2]) for v in vertices]
+
+    # Create edges for the quadrilateral face
+    e0 = Part.makeLine(pts[0], pts[1])
+    e1 = Part.makeLine(pts[1], pts[2])
+    e2 = Part.makeLine(pts[2], pts[3])
+    e3 = Part.makeLine(pts[3], pts[0])
+
+    wire = Part.Wire([e0, e1, e2, e3])
+    face = Part.Face(wire)
+
+    return face
+
+
+# ============================================================================
+# SPREADSHEET PARAMETERS
+# ============================================================================
+
+def get_params_from_spreadsheet(doc):
+    """Try to read brick parameters from spreadsheet."""
+    params = {}
+
+    try:
+        ss = doc.getObject("Spreadsheet")
+        if ss is None:
+            return None
+
+        # Map of our parameter names to possible spreadsheet aliases
+        param_map = {
+            'brick_length': ['brickWidth', 'brickLength', 'brick_width', 'brick_length'],
+            'brick_height': ['brickHeight', 'brick_height'],
+            'brick_thickness': ['brickDepth', 'brickThickness', 'brick_depth', 'brick_thickness'],
+            'mortar_thickness': ['mortar', 'mortarThickness', 'mortar_thickness'],
+            'material_thickness': ['materialThickness', 'material_thickness'],
+        }
+
+        for param_key, cell_names in param_map.items():
+            for cell_name in cell_names:
+                try:
+                    val = ss.get(cell_name)
+                    if val is not None:
+                        params[param_key] = float(val)
+                        break
+                except:
+                    continue
+
+        return params if params else None
+    except:
+        return None
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def process_face(face, params, create_solids=True):
+    """
+    Process a single cylindrical/conical face and generate brick geometry.
+
+    Args:
+        face: FreeCAD face to process
+        params: Dict of brick parameters
+        create_solids: If True, create full brick solids. If False, just faces.
+
+    Returns:
+        tuple: (brick_shapes, metadata)
+    """
+    # Analyze the face
+    face_info = analyze_cylindrical_face(face)
+
+    print(f"  Surface type: {face_info['type']}")
+    print(f"  Z range: {face_info['z_min']:.2f} to {face_info['z_max']:.2f}")
+    print(f"  Original radius: {face_info['radius_at_z_min']:.2f} to {face_info['radius_at_z_max']:.2f}")
+    print(f"  Concave: {face_info['is_concave']}")
+
+    # Use materialThickness for the radial depth of bricks (skin thickness)
+    # This is the depth of the mortar joints at the outer (visible) face
+    material_thickness = params['material_thickness']
+
+    # Offset radius inward by half material thickness so bricks are centered on the surface
+    half_thickness = material_thickness / 2.0
+    radius_at_z_min = face_info['radius_at_z_min'] - half_thickness
+    radius_at_z_max = face_info['radius_at_z_max'] - half_thickness
+
+    print(f"  Material thickness: {material_thickness:.2f}")
+    print(f"  Brick placement radius (centered): {radius_at_z_min:.2f} to {radius_at_z_max:.2f}")
+
+    # Create geometry generator
+    rbg = RadialBrickGeometry(
+        z_min=face_info['z_min'],
+        z_max=face_info['z_max'],
+        radius_at_z_min=radius_at_z_min,
+        radius_at_z_max=radius_at_z_max,
+        brick_length=params['brick_length'],
+        brick_height=params['brick_height'],
+        brick_thickness=material_thickness,  # Use materialThickness for radial depth
+        mortar_thickness=params['mortar_thickness'],
+        is_concave=False,  # Always project outward since we offset inward
+        bond_offset=0.5
+    )
+
+    # Generate brick definitions
+    result = rbg.generate()
+    bricks = result['bricks']
+    metadata = result['metadata']
+
+    print(f"  Courses: {metadata['num_courses']}")
+    print(f"  Total bricks: {metadata['total_bricks']}")
+    print(f"  Bricks per course: {metadata['min_bricks_per_course']} to {metadata['max_bricks_per_course']}")
+
+    # Create FreeCAD geometry
+    brick_shapes = []
+
+    for i, brick in enumerate(bricks):
+        if create_solids:
+            shape = create_brick_solid(brick, rbg)
+        else:
+            shape = create_brick_face_only(brick, rbg)
+
+        if shape is not None:
+            brick_shapes.append(shape)
+
+        if (i + 1) % 1000 == 0:
+            print(f"    Created {i+1}/{len(bricks)} bricks...")
+
+    return brick_shapes, metadata
+
+
+if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins__':
+    doc = App.ActiveDocument
+
+    if doc is None:
+        print("ERROR: No active document. Please create or open a document first.")
+    else:
+        # Get selection
+        selection = App.Gui.Selection.getSelectionEx()
+
+        if not selection:
+            print("ERROR: Please select one or more cylindrical or conical faces.")
+            print("       Use Ctrl+click to select multiple faces.")
+        elif not selection[0].SubObjects:
+            print("ERROR: Please select faces, not the entire object.")
+            print("       Click on a cylindrical or conical face to select it.")
+        else:
+            sel_obj = selection[0].Object
+            obj_name = sel_obj.Label
+            sub_elements = selection[0].SubElementNames
+
+            print(f"\n{'='*60}")
+            print(f"Radial Brick Generator v1.0.0")
+            print(f"{'='*60}")
+            print(f"Object: {obj_name}")
+            print(f"Selected: {len(sub_elements)} face(s)")
+            print()
+
+            # Get parameters from spreadsheet or use defaults
+            params = get_params_from_spreadsheet(doc)
+            if params is None:
+                params = {}
+
+            # Fill in defaults (HO scale brick dimensions)
+            params.setdefault('brick_length', 2.32)    # ~8" at 1:87
+            params.setdefault('brick_height', 0.65)    # ~2.25" at 1:87
+            params.setdefault('brick_thickness', 1.09) # ~4" at 1:87
+            params.setdefault('mortar_thickness', 0.11)  # ~3/8" at 1:87
+            params.setdefault('material_thickness', 0.3)  # Default skin depth
+
+            print(f"Brick: {params['brick_length']:.2f} x {params['brick_height']:.2f} x {params['brick_thickness']:.2f} mm")
+            print(f"Mortar: {params['mortar_thickness']:.2f} mm")
+            print()
+
+            # Process each selected face
+            all_shapes = []
+            total_bricks = 0
+            faces_processed = []
+
+            for face_num, sub_element in enumerate(sub_elements, 1):
+                try:
+                    face_index = int(sub_element.replace('Face', '')) - 1
+                    face = sel_obj.Shape.Faces[face_index]
+
+                    print(f"--- Processing {sub_element} ({face_num}/{len(sub_elements)}) ---")
+
+                    brick_shapes, metadata = process_face(face, params, create_solids=True)
+
+                    if brick_shapes:
+                        # Create compound for this face
+                        face_compound = Part.Compound(brick_shapes)
+                        all_shapes.append(face_compound)
+                        total_bricks += len(brick_shapes)
+                        faces_processed.append(sub_element)
+                        print(f"  ✓ Complete")
+                    else:
+                        print(f"  ✗ No bricks generated")
+
+                    print()
+
+                except ValueError as e:
+                    print(f"  ERROR: {e}")
+                    print()
+                    continue
+                except Exception as e:
+                    print(f"  ERROR: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print()
+                    continue
+
+            # Create final result
+            if all_shapes:
+                print(f"{'='*60}")
+                print(f"Creating result object...")
+
+                try:
+                    if len(all_shapes) == 1:
+                        final_shape = all_shapes[0]
+                    else:
+                        final_shape = Part.Compound(all_shapes)
+
+                    # Create result object
+                    result_obj = doc.addObject("Part::Feature", f"RadialBricks_{obj_name}")
+                    result_obj.Shape = final_shape
+
+                    # Add metadata properties
+                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
+                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                    result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
+                    result_obj.addProperty("App::PropertyString", "SourceFaces", "Metadata", "Source faces")
+                    result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
+
+                    result_obj.GeneratorName = "radial_brick_generator"
+                    result_obj.GeneratorVersion = "1.0.0"
+                    result_obj.SourceObject = obj_name
+                    result_obj.SourceFaces = ", ".join(faces_processed)
+                    result_obj.BrickCount = total_bricks
+
+                    doc.recompute()
+
+                    print()
+                    print(f"✓ Created: {result_obj.Label}")
+                    print(f"  Total bricks: {total_bricks}")
+                    print(f"  Faces processed: {len(faces_processed)}")
+                    print()
+                    print(f"{'='*60}")
+                    print("SUCCESS!")
+                    print(f"{'='*60}")
+
+                except Exception as e:
+                    print(f"ERROR creating result: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print("ERROR: No faces were successfully processed")
