@@ -503,6 +503,10 @@ def generate_shingles(face, base_object, params):
     # This reliably determines eave-to-ridge direction from vertex Z coordinates
     origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
 
+    # v5.0.1: No automatic normal flipping - the coordinate system from
+    # get_face_coordinate_system should already be correct.
+    # The face normal direction determines which side of the roof the shingles appear on.
+
     print(f"  Orientation (v5.0.0 bounding-box method):")
     print(f"  Normal: ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
     print(f"  V-vec (up slope): ({v_vec.x:.3f}, {v_vec.y:.3f}, {v_vec.z:.3f})")
@@ -556,13 +560,15 @@ def generate_shingles(face, base_object, params):
             top_position = origin + u_scaled + v_scaled
             
             # Build rotation matrix from target coordinate system
-            # Shingle local coords: X=width, Y=height(down slope), Z=thickness(outward)
-            # Target coords: U=across, V=up slope, Normal=outward
-            # So: local X -> U, local Y -> V, local Z -> Normal
+            # Shingle local coords: X=width, Y=height(DOWN slope), Z=thickness(outward)
+            # Target coords: U=across, V=UP slope, Normal=outward
+            # Since local Y is down-slope but V is up-slope, we negate V in the mapping
+            # So: local X -> U, local Y -> -V, local Z -> Normal
+            neg_v_vec = App.Vector(-v_vec.x, -v_vec.y, -v_vec.z)
             rotation_matrix = App.Matrix(
-                u_vec.x, v_vec.x, normal.x, 0,
-                u_vec.y, v_vec.y, normal.y, 0,
-                u_vec.z, v_vec.z, normal.z, 0,
+                u_vec.x, neg_v_vec.x, normal.x, 0,
+                u_vec.y, neg_v_vec.y, normal.y, 0,
+                u_vec.z, neg_v_vec.z, normal.z, 0,
                 0, 0, 0, 1
             )
             final_rotation = App.Rotation(rotation_matrix)
@@ -575,13 +581,13 @@ def generate_shingles(face, base_object, params):
 
             else:
                 # Row 1+: Triangular wedge cross-section
-                # Top edge: thin (wedge_thickness) against roof
-                # Bottom edge: tapers to a point
+                # Top edge (Y=0, toward ridge): tapers to roof surface
+                # Bottom edge (Y=shingle_height, toward eave): thick (wedge_thickness)
                 # Height: full shingle_height
 
-                p1 = App.Vector(0, 0, 0)                      # Top back (against roof, uphill)
-                p2 = App.Vector(0, 0, wedge_thickness)        # Top front (visible surface, uphill)
-                p3 = App.Vector(0, shingle_height, 0)         # Bottom point (tapers to roof surface)
+                p1 = App.Vector(0, 0, 0)                              # Top point (tapers to roof, toward ridge)
+                p2 = App.Vector(0, shingle_height, 0)                 # Bottom back (against roof, toward eave)
+                p3 = App.Vector(0, shingle_height, wedge_thickness)   # Bottom front (visible surface, toward eave)
 
                 # Create edges connecting the points
                 l1 = Part.LineSegment(p1, p2)
