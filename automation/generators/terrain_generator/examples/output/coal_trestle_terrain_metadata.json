@@ -1,0 +1,90 @@
+{
+  "generator_version": "0.1.0",
+  "generation_timestamp": "2026-02-19T06:05:27Z",
+  "terrain_spec": {
+    "feature_type": "hillside",
+    "dimensions": {
+      "width_inches": 12.0,
+      "length_inches": 18.0,
+      "height_inches": 6.0,
+      "material_depth_inches": 2.0
+    },
+    "geometry": {
+      "base_elevation": 2.0,
+      "peak_elevation": 8.0,
+      "slope_angle_dominant": 0.0,
+      "slope_angle_variance": 5.0
+    },
+    "geology": {
+      "rock_type": "sandstone",
+      "jointing_angle_primary": 60.0,
+      "jointing_angle_secondary": null,
+      "jointing_spacing": 1.5,
+      "jointing_spacing_variance": 0.2,
+      "weathering_intensity": 0.4,
+      "erosion_features": [
+        "drainage_lines"
+      ]
+    },
+    "material": "xps_foam",
+    "cnc_constraints": {
+      "max_tool_diameter": 0.25,
+      "max_depth_per_pass": 0.25,
+      "surface_finish": "detail"
+    },
+    "resolution": 0.05,
+    "seed": 42,
+    "vegetation_zones": [],
+    "reference_photos": [],
+    "cad_model": null
+  },
+  "mesh_stats": {
+    "vertex_count": 172800,
+    "face_count": 345596,
+    "bounding_box_inches": [
+      11.950000000000001,
+      17.95,
+      6.307195031188709
+    ],
+    "bounding_box_min": [
+      0.0,
+      0.0,
+      1.6988049688112914
+    ],
+    "bounding_box_max": [
+      11.950000000000001,
+      17.95,
+      8.006
+    ]
+  },
+  "validation": {
+    "valid": true,
+    "vertex_count": 172800,
+    "face_count": 345596,
+    "bounding_box": [
+      11.950000000000001,
+      17.95,
+      6.307195031188709
+    ],
+    "bounding_box_min": [
+      0.0,
+      0.0,
+      1.6988049688112914
+    ],
+    "bounding_box_max": [
+      11.950000000000001,
+      17.95,
+      8.006
+    ],
+    "issues": []
+  },
+  "export": {
+    "format": "binary STL",
+    "filepath": "/Volumes/Files/claude/freecad-mcp/terrain_generator/examples/output/coal_trestle_terrain.stl",
+    "size_bytes": 17279884
+  },
+  "cad_integration": {
+    "freecad_import_notes": "Import via Mesh workbench: mesh_operations import_mesh. Then convert to solid: mesh_operations mesh_to_solid. Units are inches.",
+    "cnc_notes": "Bounding box: 11.95 x 17.95 x 6.31 inches. Tool access verified for 0.25\" endmill."
+  }
+}
