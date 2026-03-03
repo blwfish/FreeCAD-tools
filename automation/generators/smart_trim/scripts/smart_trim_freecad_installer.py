@@ -98,10 +98,10 @@ def install_files(macro_dir):
         List of successfully installed file paths
     """
     installed = []
-    cwd = Path.cwd()
-    
-    print(f"\nWorking directory: {cwd}")
-    print(f"Files in current directory: {[f.name for f in cwd.glob('*') if f.is_file()]}\n")
+    source_dir = Path(__file__).parent.parent  # scripts/ -> smart_trim/
+
+    print(f"\nSource directory: {source_dir}")
+    print(f"Files in source directory: {[f.name for f in source_dir.glob('*') if f.is_file()]}\n")
     print(f"Installing to: {macro_dir}\n")
     
     # Create _lib subdirectory
@@ -115,7 +115,7 @@ def install_files(macro_dir):
     
     # Install macros to root
     for filename in MACROS_TO_INSTALL:
-        source = cwd / filename
+        source = source_dir / filename
         dest = macro_dir / filename
         
         print(f"Installing macro: {filename}")
@@ -136,7 +136,7 @@ def install_files(macro_dir):
     
     # Install libraries to _lib subdirectory
     for filename in LIBS_TO_INSTALL:
-        source = cwd / filename
+        source = source_dir / filename
         dest = lib_dir / filename
         
         print(f"\nInstalling library: {filename}")
@@ -162,7 +162,7 @@ def install_files(macro_dir):
     
     # Try to install optional files to _lib (don't fail if missing)
     for filename in OPTIONAL_FILES:
-        source = cwd / filename
+        source = source_dir / filename
         dest = lib_dir / filename
         
         if source.exists():
@@ -186,7 +186,7 @@ def verify_imports():
     print("\nVerifying imports...")
     
     # Add _lib to Python path for imports
-    lib_path = Path.cwd() / "_lib"
+    lib_path = Path(__file__).parent.parent / "_lib"
     if lib_path.exists():
         sys.path.insert(0, str(lib_path))
     
