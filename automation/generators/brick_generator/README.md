@@ -1,6 +1,6 @@
-# Brick Generator v4.0.0
+# Brick Generator v5.0.0
 
-Parametric brick wall generator for FreeCAD with automatic opening detection. Creates photorealistic masonry walls using four different bond patterns: Stretcher, English, Flemish, and Common. All generated as thin geometry optimized for 3D printing and laser cutting.
+Parametric brick wall generator for FreeCAD with automatic opening detection. Creates photorealistic masonry walls using four different bond patterns: Stretcher, English, Flemish, and Common. Flemish and English bonds now use proper queen closers for accurate historical patterns.
 
 ## Features
 
@@ -14,7 +14,14 @@ Parametric brick wall generator for FreeCAD with automatic opening detection. Cr
 - **Metadata tracking**: Stores generator version, source, and configuration in result object
 - **Fast**: Compound generation (no fusing overhead)
 
-## What's New in v4.0.0
+## What's New in v5.0.0
+
+- **Proper queen closers** for Flemish and English bonds
+- **Exact wall width** - courses now fit precisely within wall boundaries
+- **Header alignment** - headers center correctly over stretchers below
+- **Uniform surface depth** - all bricks use `brickDepth` for consistent flat surface; Stretcher bond can use thin `materialThickness`
+
+### v4.0.0 Features (included)
 
 - **Automatic opening detection** - finds holes in the face
 - **Automatic punchout** - generates cutout geometry matching openings
@@ -153,12 +160,15 @@ All parameters are read from the FreeCAD spreadsheet. If not found, defaults are
 
 | Parameter | Default | Unit | Notes |
 |-----------|---------|------|-------|
-| `brick_width` | 2.32 | mm | Stretcher orientation (HO scale = 8") |
-| `brick_height` | 0.65 | mm | Constant for all bricks (HO scale = 2.25") |
-| `brick_depth` | 1.09 | mm | Into the wall (HO scale = 3.75") |
+| `brickWidth` | 2.32 | mm | Stretcher orientation (HO scale = 8") |
+| `brickHeight` | 0.65 | mm | Constant for all bricks (HO scale = 2.25") |
+| `brickDepth` | 1.09 | mm | Into the wall (HO scale = 3.75") - used for Flemish/English/Common bonds |
+| `materialThickness` | 0.3 | mm | Thin skin depth - used for Stretcher bond |
 | `mortar` | 0.11 | mm | Joint thickness (HO scale = 0.375") |
-| `bond_type` | "stretcher" | text | stretcher, english, flemish, or common |
-| `common_bond_count` | 5 | count | Only for common bond |
+| `bondType` | "stretcher" | text | stretcher, english, flemish, or common |
+| `commonBondCount` | 5 | count | Only for common bond |
+
+**Note:** All brick types (stretchers, headers, closers) use the same `brickDepth` for a flat wall surface. Stretcher bond can alternatively use `materialThickness` for thin skin rendering.
 
 ## HO Scale Defaults
 
@@ -228,6 +238,10 @@ mortar = 0.15         (0.5" / 87, sometimes thicker for old mortar)
 
 4. **Brick orientation**: All bricks align to the detected U/V axes
    - No diagonal or complex herringbone patterns yet
+
+5. **Vertical faces only**: Horizontal faces (floors, platforms) are not yet supported
+   - Generator requires faces with meaningful Z extent
+   - Future: Horizontal brick surfaces for platforms, patios, etc.
 
 ## Testing
 

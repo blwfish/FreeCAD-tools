@@ -169,7 +169,7 @@ class TestStretcherBond:
 
 class TestEnglishBond:
     """Test English bond pattern."""
-    
+
     def test_english_basic(self):
         """Basic English bond generation."""
         bg = BrickGeometry(
@@ -180,9 +180,9 @@ class TestEnglishBond:
         result = bg.generate()
         assert len(result['bricks']) > 0
         assert result['metadata']['bond_type'] == 'english'
-    
+
     def test_english_alternating_courses(self):
-        """Alternating stretcher and header courses."""
+        """Alternating stretcher and header courses (ignoring closers)."""
         bg = BrickGeometry(
             u_length=100, v_length=100,
             brick_width=2.32, brick_height=0.65, brick_depth=1.09,
@@ -190,25 +190,27 @@ class TestEnglishBond:
         )
         result = bg.generate()
         bricks = result['bricks']
-        
-        # Group by course
+
+        # Group by course, excluding closers
         by_course = {}
         for brick in bricks:
+            if brick.brick_type == 'closer':
+                continue  # Skip closers for pattern check
             if brick.course not in by_course:
                 by_course[brick.course] = []
             by_course[brick.course].append(brick)
-        
+
         # Check alternation
         for course_num, course_bricks in by_course.items():
             brick_type = course_bricks[0].brick_type
             assert all(b.brick_type == brick_type for b in course_bricks), \
                 f"Course {course_num} has mixed brick types"
-            
+
             if course_num % 2 == 0:
                 assert brick_type == 'stretcher'
             else:
                 assert brick_type == 'header'
-    
+
     def test_english_header_dimensions(self):
         """Header bricks have correct rotated dimensions."""
         bg = BrickGeometry(
@@ -217,19 +219,54 @@ class TestEnglishBond:
             mortar=0.11, bond_type='english'
         )
         result = bg.generate()
-        
+
         for brick in result['bricks']:
             if brick.brick_type == 'header':
                 assert brick.width == 1.09  # depth becomes width
                 assert brick.depth == 2.32  # width becomes depth
-            else:
+            elif brick.brick_type == 'stretcher':
                 assert brick.width == 2.32
                 assert brick.depth == 1.09
+            # Closers have variable width, so we don't check them
+
+    def test_english_has_closers(self):
+        """English bond should have queen closers at ends."""
+        bg = BrickGeometry(
+            u_length=50, v_length=50,
+            brick_width=2.32, brick_height=0.65, brick_depth=1.09,
+            mortar=0.11, bond_type='english'
+        )
+        result = bg.generate()
+        closers = [b for b in result['bricks'] if b.brick_type == 'closer']
+        assert len(closers) > 0, "English bond should have queen closers"
+
+    def test_english_wall_width_exact(self):
+        """Courses should exactly fill the wall width."""
+        bg = BrickGeometry(
+            u_length=50, v_length=10,
+            brick_width=2.32, brick_height=0.65, brick_depth=1.09,
+            mortar=0.11, bond_type='english'
+        )
+        result = bg.generate()
+
+        # Check each course fills the wall exactly
+        by_course = {}
+        for brick in result['bricks']:
+            if brick.course not in by_course:
+                by_course[brick.course] = []
+            by_course[brick.course].append(brick)
+
+        for course_num, course_bricks in by_course.items():
+            course_bricks.sort(key=lambda b: b.u)
+            last = course_bricks[-1]
+            total_width = last.u + last.width
+            assert total_width == pytest.approx(50, abs=0.01), \
+                f"Course {course_num} width {total_width} != 50"
 
 
 class TestFlemishBond:
     """Test Flemish bond pattern."""
-    
+
     def test_flemish_basic(self):
         """Basic Flemish bond generation."""
         bg = BrickGeometry(
@@ -240,9 +277,9 @@ class TestFlemishBond:
         result = bg.generate()
         assert len(result['bricks']) > 0
         assert result['metadata']['bond_type'] == 'flemish'
-    
+
     def test_flemish_alternating_per_course(self):
-        """Each course alternates stretchers and headers."""
+        """Each course alternates stretchers and headers (excluding closers)."""
         bg = BrickGeometry(
             u_length=100, v_length=50,
             brick_width=2.32, brick_height=0.65, brick_depth=1.09,
@@ -250,20 +287,81 @@ class TestFlemishBond:
         )
         result = bg.generate()
         bricks = result['bricks']
-        
-        # Group by course
+
+        # Group by course, excluding closers
         by_course = {}
         for brick in bricks:
+            if brick.brick_type == 'closer':
+                continue
             if brick.course not in by_course:
                 by_course[brick.course] = []
             by_course[brick.course].append(brick)
-        
+
         # Each course should have alternating pattern
-        for course_bricks in by_course.values():
+        for course_num, course_bricks in by_course.items():
+            course_bricks.sort(key=lambda b: b.u)
             types = [b.brick_type for b in course_bricks]
             # Should alternate between stretcher and header
             for i in range(len(types) - 1):
-                assert types[i] != types[i+1], "Flemish bond should alternate per course"
+                assert types[i] != types[i+1], \
+                    f"Flemish bond course {course_num} should alternate: {types}"
+
+    def test_flemish_has_closers(self):
+        """Flemish bond should have queen closers at ends."""
+        bg = BrickGeometry(
+            u_length=50, v_length=50,
+            brick_width=2.32, brick_height=0.65, brick_depth=1.09,
+            mortar=0.11, bond_type='flemish'
+        )
+        result = bg.generate()
+        closers = [b for b in result['bricks'] if b.brick_type == 'closer']
+        assert len(closers) > 0, "Flemish bond should have queen closers"
+
+    def test_flemish_wall_width_exact(self):
+        """Both even and odd courses should exactly fill the wall width."""
+        bg = BrickGeometry(
+            u_length=50, v_length=10,
+            brick_width=2.32, brick_height=0.65, brick_depth=1.09,
+            mortar=0.11, bond_type='flemish'
+        )
+        result = bg.generate()
+
+        by_course = {}
+        for brick in result['bricks']:
+            if brick.course not in by_course:
+                by_course[brick.course] = []
+            by_course[brick.course].append(brick)
+
+        for course_num, course_bricks in by_course.items():
+            course_bricks.sort(key=lambda b: b.u)
+            last = course_bricks[-1]
+            total_width = last.u + last.width
+            assert total_width == pytest.approx(50, abs=0.01), \
+                f"Course {course_num} width {total_width} != 50"
+
+    def test_flemish_header_alignment(self):
+        """Headers in odd courses should center over stretchers in even courses."""
+        bg = BrickGeometry(
+            u_length=100, v_length=10,
+            brick_width=2.32, brick_height=0.65, brick_depth=1.09,
+            mortar=0.11, bond_type='flemish'
+        )
+        result = bg.generate()
+
+        # Get stretcher centers from course 0
+        stretchers_c0 = [b for b in result['bricks']
+                        if b.course == 0 and b.brick_type == 'stretcher']
+        stretcher_centers = [(b.u + b.width / 2) for b in stretchers_c0]
+
+        # Get header centers from course 1
+        headers_c1 = [b for b in result['bricks']
+                     if b.course == 1 and b.brick_type == 'header']
+        header_centers = [(b.u + b.width / 2) for b in headers_c1]
+
+        # Each header should align with a stretcher
+        for hc in header_centers:
+            aligned = any(abs(hc - sc) < 0.1 for sc in stretcher_centers)
+            assert aligned, f"Header at {hc} not aligned with any stretcher"
 
 
 class TestCommonBond:
