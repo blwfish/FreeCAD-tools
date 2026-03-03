@@ -50,37 +50,55 @@ OPTIONAL_FILES = [
 def get_freecad_macro_directory():
     """
     Detect FreeCAD Macro directory based on OS.
-    
+
+    Prefers versioned subdirectories (e.g. v1-2/Macro, v1-1/Macro) over the
+    legacy unversioned Macro directory, matching FreeCAD's own preference.
+
     Returns:
         Path object for FreeCAD Macro directory
-        
+
     Raises:
         FileNotFoundError if directory cannot be found
     """
+    # When running inside FreeCAD, ask it directly
+    try:
+        import FreeCAD
+        return Path(FreeCAD.getUserMacroDir())
+    except ImportError:
+        pass
+
     system = platform.system()
-    
+
     if system == "Darwin":
-        # macOS
-        macro_dir = Path.home() / "Library" / "Application Support" / "FreeCAD" / "Macro"
+        base_dir = Path.home() / "Library" / "Application Support" / "FreeCAD"
     elif system == "Linux":
-        # Linux
-        macro_dir = Path.home() / ".FreeCAD" / "Macro"
+        base_dir = Path.home() / ".FreeCAD"
     elif system == "Windows":
-        # Windows
         appdata = os.getenv("APPDATA")
-        if appdata:
-            macro_dir = Path(appdata) / "FreeCAD" / "Macro"
-        else:
+        if not appdata:
             raise FileNotFoundError("Could not determine Windows APPDATA directory")
+        base_dir = Path(appdata) / "FreeCAD"
     else:
         raise OSError(f"Unsupported OS: {system}")
-    
+
+    # Prefer the highest versioned Macro dir (v1-2 > v1-1 > unversioned)
+    import re
+    versioned = sorted(
+        [d for d in base_dir.iterdir()
+         if d.is_dir() and re.match(r'v\d+-\d+', d.name) and (d / "Macro").exists()],
+        key=lambda d: [int(x) for x in d.name[1:].split('-')],
+        reverse=True
+    )
+    if versioned:
+        return versioned[0] / "Macro"
+
+    # Fall back to legacy unversioned directory
+    macro_dir = base_dir / "Macro"
     if not macro_dir.exists():
         raise FileNotFoundError(
-            f"FreeCAD Macro directory not found: {macro_dir}\n"
+            f"FreeCAD Macro directory not found under {base_dir}\n"
             f"Please install FreeCAD first."
         )
-    
     return macro_dir
 
 
@@ -123,7 +141,7 @@ def install_files(macro_dir):
         print(f"  To:   {dest}")
         
         if not source.exists():
-            print(f"✗ SKIP: {filename} (not found in {cwd})")
+            print(f"✗ SKIP: {filename} (not found in {source_dir})")
             continue
         
         try:
@@ -144,7 +162,7 @@ def install_files(macro_dir):
         print(f"  To:   {dest}")
         
         if not source.exists():
-            print(f"✗ SKIP: {filename} (not found in {cwd})")
+            print(f"✗ SKIP: {filename} (not found in {source_dir})")
             continue
         
         try:
