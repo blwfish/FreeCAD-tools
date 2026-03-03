@@ -567,38 +567,80 @@ def create_brick_from_def(brick_def, origin, u_vec, v_vec, normal):
 
 
 def get_params_from_spreadsheet(doc):
-    """Try to read parameters from spreadsheet."""
+    """Try to read parameters from spreadsheet. Returns dict of found params (may be partial)."""
     params = {}
-    
+
     try:
         ss = doc.getObject("Spreadsheet")
         if ss is None:
-            return None
-        
+            print("WARNING: No 'Spreadsheet' object found in document — all brick params will use defaults")
+            return params
+
         param_map = {
-            'brick_width': 'brickWidth',
-            'brick_height': 'brickHeight',
-            'brick_depth': 'brickDepth',
-            'mortar': 'mortar',
-            'bond_type': 'bondType',
-            'common_bond_count': 'commonBondCount',
-            'material_thickness': 'materialThickness'
+            'brick_width':        'brickWidth',
+            'brick_height':       'brickHeight',
+            'brick_depth':        'brickDepth',
+            'mortar':             'mortar',
+            'bond_type':          'bondType',
+            'common_bond_count':  'commonBondCount',
+            'material_thickness': 'materialThickness',
         }
-        
-        for param_key, cell_name in param_map.items():
+
+        for param_key, alias in param_map.items():
             try:
-                val = ss.get(cell_name)
+                val = ss.get(alias)
                 if val is not None:
-                    if param_key in ['bond_type']:
-                        params[param_key] = str(val)
-                    else:
-                        params[param_key] = float(val)
+                    params[param_key] = str(val) if param_key == 'bond_type' else float(val)
             except:
-                continue
-        
-        return params if params else None
-    except:
-        return None
+                pass  # alias not in spreadsheet — will be caught by resolve_brick_params
+
+    except Exception as e:
+        print(f"WARNING: Error reading spreadsheet: {e}")
+
+    return params
+
+
+# Defaults and descriptions used by resolve_brick_params
+_BRICK_PARAM_DEFAULTS = {
+    'brick_width':        (2.32,        'brickWidth',       'mm  (HO 8" stretcher)'),
+    'brick_height':       (0.65,        'brickHeight',      'mm  (HO 2.25")'),
+    'brick_depth':        (1.09,        'brickDepth',       'mm  (HO 3.75")'),
+    'mortar':             (0.11,        'mortar',           'mm  (HO ~0.375" joint)'),
+    'bond_type':          ('stretcher', 'bondType',         'stretcher/english/flemish/common'),
+    'common_bond_count':  (5,           'commonBondCount',  'header courses for common bond'),
+    'material_thickness': (0.3,         'materialThickness','mm  rendered skin depth'),
+}
+
+
+def resolve_brick_params(params):
+    """
+    Resolve final brick params from spreadsheet dict, warning loudly for each
+    missing entry so the user knows exactly why defaults are being applied.
+
+    Returns dict with keys: brick_width, brick_height, brick_depth, mortar,
+                            bond_type, common_bond_count, material_thickness
+    """
+    resolved = {}
+    missing = []
+
+    for key, (default, alias, desc) in _BRICK_PARAM_DEFAULTS.items():
+        if key in params:
+            resolved[key] = params[key]
+        else:
+            resolved[key] = default
+            missing.append((alias, default, desc))
+
+    if missing:
+        print(f"\n{'!'*60}")
+        print(f"! BRICK GENERATOR — {len(missing)} param(s) not found in spreadsheet:")
+        for alias, default, desc in missing:
+            print(f"!   {alias:22s} → using default {default!r}  ({desc})")
+        print(f"! Add these aliases to your spreadsheet to control them.")
+        print(f"{'!'*60}\n")
+    else:
+        print("✓ All brick params loaded from spreadsheet")
+
+    return resolved
 
 
 # ============================================================================
@@ -640,18 +682,14 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     face = Part.Face(outer_wire)
                     
                     # Get parameters first (needed for grid snapping)
-                    params = get_params_from_spreadsheet(doc)
-                    if params is None:
-                        params = {}
-                    
-                    # Fill in defaults
-                    brick_width = params.get('brick_width', 2.32)
-                    brick_height = params.get('brick_height', 0.65)
-                    brick_depth = params.get('brick_depth', 1.09)  # Used for header width calculation
-                    skin_depth = params.get('material_thickness', 0.3)  # Rendered brick thickness
-                    mortar = params.get('mortar', 0.11)
-                    bond_type = params.get('bond_type', 'stretcher')
-                    common_bond_count = int(params.get('common_bond_count', 5))
+                    params = resolve_brick_params(get_params_from_spreadsheet(doc))
+                    brick_width = params['brick_width']
+                    brick_height = params['brick_height']
+                    brick_depth = params['brick_depth']
+                    skin_depth = params['material_thickness']
+                    mortar = params['mortar']
+                    bond_type = params['bond_type']
+                    common_bond_count = int(params['common_bond_count'])
                     
                     # Get face coordinate system
                     origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
@@ -791,18 +829,14 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                 print(f"{'='*60}\n")
                 
                 # Get parameters once for all faces
-                params = get_params_from_spreadsheet(doc)
-                if params is None:
-                    params = {}
-                
-                # Fill in defaults
-                brick_width = params.get('brick_width', 2.32)
-                brick_height = params.get('brick_height', 0.65)
-                brick_depth = params.get('brick_depth', 1.09)  # Used for header width calculation
-                skin_depth = params.get('material_thickness', 0.3)  # Rendered brick thickness
-                mortar = params.get('mortar', 0.11)
-                bond_type = params.get('bond_type', 'stretcher')
-                common_bond_count = int(params.get('common_bond_count', 5))
+                params = resolve_brick_params(get_params_from_spreadsheet(doc))
+                brick_width = params['brick_width']
+                brick_height = params['brick_height']
+                brick_depth = params['brick_depth']
+                skin_depth = params['material_thickness']
+                mortar = params['mortar']
+                bond_type = params['bond_type']
+                common_bond_count = int(params['common_bond_count'])
                 
                 # Collect all brick shapes from all faces
                 all_brick_shapes = []
