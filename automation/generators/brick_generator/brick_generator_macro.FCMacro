@@ -81,7 +81,7 @@ except ImportError:
         try:
             placement = obj.getGlobalPlacement()
             if not placement.isIdentity():
-                face = face.transformGeometry(placement.toMatrix()).Faces[0]
+                face = face.transformShape(placement.toMatrix())
         except AttributeError:
             pass
         return face
