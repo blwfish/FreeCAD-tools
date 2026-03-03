@@ -6,7 +6,7 @@ Usage:
     python3 freecad_installer.py          # standalone
     Execute via Macro menu inside FreeCAD
 
-Version: 5.0.0
+Version: 5.1.0
 """
 
 import os
@@ -16,7 +16,7 @@ import shutil
 import platform
 from pathlib import Path
 
-GENERATOR_VERSION = "5.0.0"
+GENERATOR_VERSION = "5.1.0"
 
 
 def get_macro_dir():
@@ -67,6 +67,7 @@ def run():
         return False
 
     script_dir = Path(__file__).parent
+    shared_dir = script_dir.parent / "_shared"
     lib_dir = macro_dir / "_lib"
     lib_dir.mkdir(parents=True, exist_ok=True)
 
@@ -77,11 +78,18 @@ def run():
         # Geometry library to _lib/
         shutil.copy2(script_dir / "brick_geometry.py",
                      lib_dir / "brick_geometry.py")
+        # Shared FreeCAD utilities to _lib/
+        shared_utils = shared_dir / "freecad_utils.py"
+        if shared_utils.exists():
+            shutil.copy2(shared_utils, lib_dir / "freecad_utils.py")
+        else:
+            print(f"  WARNING: {shared_utils} not found — skipping freecad_utils")
 
         print(f"✓ Brick generator v{GENERATOR_VERSION} installed")
         print(f"  Location: {macro_dir}")
         print(f"  Macro: brick_generator_macro.FCMacro")
         print(f"  Library: _lib/brick_geometry.py")
+        print(f"  Library: _lib/freecad_utils.py")
         return True
 
     except Exception as e:

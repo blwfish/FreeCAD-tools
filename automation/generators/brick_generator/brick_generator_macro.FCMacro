@@ -1,5 +1,5 @@
 """
-Parametric Brick Generator Macro v4.2.0
+Parametric Brick Generator Macro v4.3.0
 
 Simplified UI layer that orchestrates brick generation using brick_geometry library.
 Handles FreeCAD coordinate systems, object creation, and automatic punchout generation.
@@ -8,6 +8,8 @@ Openings (windows, doors): Automatically detected from face holes and punched ou
 No manual punchout step required - the generator produces fully finished bricked walls.
 
 Version History:
+- 4.3.0 (2026-03-03): FIX: Objects inside Part containers now brick at correct world position
+                      REFACTOR: Global placement logic moved to shared freecad_utils library
 - 4.2.0 (2024-12-02): ADD: Global 3D grid snapping for course alignment
                       FIX: Brick courses now align across all coplanar faces
                       FIX: Eliminates visible seams at face boundaries
@@ -25,8 +27,8 @@ Version History:
                       COMPATIBLE: Works with both continuous walls and segmented bays
 - 3.0.0 (2025-11-26): Initial release with bond patterns
 
-Version: 4.2.0
-Date: 2024-12-02
+Version: 4.3.0
+Date: 2026-03-03
 """
 
 import FreeCAD as App
@@ -63,6 +65,28 @@ except ImportError as e:
     print(f"Looked in: {lib_dir}")
     print("Make sure brick_geometry.py is in _lib/ subdirectory or same directory as macro")
     sys.exit(1)
+
+# Import shared FreeCAD utilities (global placement, etc.)
+if 'freecad_utils' in sys.modules:
+    del sys.modules['freecad_utils']
+try:
+    import freecad_utils
+    from freecad_utils import get_global_face, log_global_placement
+    print(f"Loaded freecad_utils v{getattr(freecad_utils, '__version__', 'unknown')}")
+except ImportError:
+    # Fallback: define inline so macro still works if shared lib not installed yet
+    print("WARNING: freecad_utils not found in _lib/ — using inline fallback")
+    def get_global_face(obj, face_index):
+        face = obj.Shape.Faces[face_index]
+        try:
+            placement = obj.getGlobalPlacement()
+            if not placement.isIdentity():
+                face = face.transformGeometry(placement.toMatrix())
+        except AttributeError:
+            pass
+        return face
+    def log_global_placement(obj, label=None):
+        pass
 
 
 def detect_openings_and_create_punchout(face, origin, u_vec, v_vec, normal, brick_depth):
@@ -842,12 +866,15 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                 all_brick_shapes = []
                 total_brick_count = 0
                 faces_processed = []
-                
+
+                # Log if object is inside a Part container with a non-identity placement
+                log_global_placement(sel_obj)
+
                 # Process each selected face
                 for face_num, sub_element in enumerate(sub_elements, 1):
                     try:
                         face_index = int(sub_element.replace('Face', '')) - 1
-                        face = sel_obj.Shape.Faces[face_index]
+                        face = get_global_face(sel_obj, face_index)
                         
                         print(f"\n--- Processing face {face_num}/{len(sub_elements)}: {sub_element} ---")
                         

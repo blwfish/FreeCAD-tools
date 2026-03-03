@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FreeCAD Installer for Smart Trim Generator v1.0.0
+FreeCAD Installer for Smart Trim Generator v1.1.0
 
 Installs the smart trim generator macro and geometry library to your FreeCAD
 Macro directory.
@@ -30,7 +30,7 @@ from pathlib import Path
 
 # Configuration
 GENERATOR_NAME = "Smart Trim Generator"
-GENERATOR_VERSION = "1.0.0"
+GENERATOR_VERSION = "1.1.0"
 
 # Files to install
 MACROS_TO_INSTALL = [
@@ -44,6 +44,12 @@ LIBS_TO_INSTALL = [
 # Optional test file (useful for development)
 OPTIONAL_FILES = [
     "test_smart_trim_geometry.py",
+]
+
+# Shared FreeCAD utilities (from _shared/ sibling directory)
+# source_dir is smart_trim/, so _shared is at source_dir.parent / "_shared"
+_SHARED_LIBS = [
+    "freecad_utils.py",
 ]
 
 
@@ -182,7 +188,7 @@ def install_files(macro_dir):
     for filename in OPTIONAL_FILES:
         source = source_dir / filename
         dest = lib_dir / filename
-        
+
         if source.exists():
             try:
                 shutil.copy2(source, dest)
@@ -190,7 +196,22 @@ def install_files(macro_dir):
                 installed.append(dest)
             except Exception as e:
                 print(f"⚠ Warning: Could not install optional {filename}: {e}")
-    
+
+    # Install shared FreeCAD utilities from _shared/ sibling directory
+    shared_dir = source_dir.parent / "_shared"
+    for filename in _SHARED_LIBS:
+        source = shared_dir / filename
+        dest = lib_dir / filename
+        if source.exists():
+            try:
+                shutil.copy2(source, dest)
+                print(f"✓ Installed (shared): {filename} → _lib/")
+                installed.append(dest)
+            except Exception as e:
+                print(f"⚠ Warning: Could not install shared {filename}: {e}")
+        else:
+            print(f"  Note: shared lib {filename} not found at {source} — skipping")
+
     return installed
 
 
