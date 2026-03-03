@@ -1,12 +1,19 @@
-*.FCStd
+# FreeCAD backup/scratch files
 *.FCbak
+*.FCBak
 *.FCStd1
 *.dxf
+
+# macOS
 .DS_Store
-.AppleDoble
-.LSOveride
+.AppleDouble
+.LSOverride
+
+# Editor
 *.swp
 *~
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
