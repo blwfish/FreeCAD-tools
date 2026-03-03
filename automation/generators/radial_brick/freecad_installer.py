@@ -2,80 +2,86 @@
 """
 FreeCAD Macro Installer for radial_brick_generator
 
-This file provides a FreeCAD-native way to install the radial brick generator.
+Usage:
+    python3 freecad_installer.py          # standalone
+    Execute via Macro menu inside FreeCAD
 
-Usage in FreeCAD:
-1. Open the Macro menu
-2. Select "Execute macro..."
-3. Choose this file (freecad_installer.py)
-4. Run it
-
-Version: 1.0.0
+Version: 1.0.1
 """
 
 import os
+import re
 import sys
 import shutil
+import platform
 from pathlib import Path
 
-GENERATOR_VERSION = "1.0.0"
+GENERATOR_VERSION = "1.0.1"
+
+
+def get_macro_dir():
+    """Return the active FreeCAD Macro directory, preferring versioned dirs."""
+    try:
+        import FreeCAD
+        return Path(FreeCAD.getUserMacroDir())
+    except ImportError:
+        pass
+
+    system = platform.system()
+    if system == "Darwin":
+        base_dir = Path.home() / "Library" / "Application Support" / "FreeCAD"
+    elif system == "Windows":
+        appdata = os.getenv("APPDATA")
+        if not appdata:
+            raise FileNotFoundError("Could not determine Windows APPDATA directory")
+        base_dir = Path(appdata) / "FreeCAD"
+    else:
+        base_dir = Path.home() / ".FreeCAD"
+
+    # Prefer highest versioned dir (v1-2 > v1-1 > unversioned)
+    versioned = sorted(
+        [d for d in base_dir.iterdir()
+         if d.is_dir() and re.match(r'v\d+-\d+', d.name) and (d / "Macro").exists()],
+        key=lambda d: [int(x) for x in d.name[1:].split('-')],
+        reverse=True
+    )
+    if versioned:
+        return versioned[0] / "Macro"
+
+    macro_dir = base_dir / "Macro"
+    if not macro_dir.exists():
+        raise FileNotFoundError(f"FreeCAD Macro directory not found under {base_dir}")
+    return macro_dir
 
 
 def run():
-    """Install radial brick generator when executed as FreeCAD macro."""
+    """Install radial brick generator."""
     try:
-        import FreeCAD
-        freecad_available = True
-    except ImportError:
-        freecad_available = False
-
-    if freecad_available:
-        # We're running inside FreeCAD
-        macro_dir = Path(FreeCAD.getUserMacroDir())
-    else:
-        # Fall back to platform detection
-        import platform
-        system = platform.system()
-
-        if system == "Darwin":  # macOS
-            base_dir = Path.home() / "Library" / "Application Support" / "FreeCAD"
-        elif system == "Windows":
-            base_dir = Path.home() / "AppData" / "Roaming" / "FreeCAD"
-        else:  # Linux
-            base_dir = Path.home() / ".config" / "FreeCAD"
-
-        macro_dir = base_dir / "Macro"
+        macro_dir = get_macro_dir()
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return False
 
     if not macro_dir.exists():
         print(f"ERROR: FreeCAD macro directory not found: {macro_dir}")
         return False
 
-    # Get source directory (where this installer is)
     script_dir = Path(__file__).parent
-
-    # Create radial_brick subdirectory for library
-    lib_dir = macro_dir / "radial_brick"
+    lib_dir = macro_dir / "_lib"
     lib_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy files
     try:
-        # Copy macro to ROOT (so it appears in FreeCAD UI)
-        macro_src = script_dir / "radial_brick_generator_macro.FCMacro"
-        macro_dst = macro_dir / "radial_brick_generator_macro.FCMacro"
-        if macro_src.exists():
-            shutil.copy2(macro_src, macro_dst)
-
-        # Copy geometry library to radial_brick/ subdirectory
-        geom_src = script_dir / "radial_brick_geometry.py"
-        geom_dst = lib_dir / "radial_brick_geometry.py"
-
-        if geom_src.exists():
-            shutil.copy2(geom_src, geom_dst)
+        # Macro to root
+        shutil.copy2(script_dir / "radial_brick_generator_macro.FCMacro",
+                     macro_dir / "radial_brick_generator_macro.FCMacro")
+        # Geometry library to _lib/
+        shutil.copy2(script_dir / "radial_brick_geometry.py",
+                     lib_dir / "radial_brick_geometry.py")
 
         print(f"✓ Radial brick generator v{GENERATOR_VERSION} installed")
         print(f"  Location: {macro_dir}")
         print(f"  Macro: radial_brick_generator_macro.FCMacro")
-        print(f"  Library: radial_brick/radial_brick_geometry.py")
+        print(f"  Library: _lib/radial_brick_geometry.py")
         return True
 
     except Exception as e:
