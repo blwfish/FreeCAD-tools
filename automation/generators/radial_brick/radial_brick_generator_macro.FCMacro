@@ -472,6 +472,16 @@ def process_face(face, params, create_solids=True):
         if (i + 1) % 1000 == 0:
             print(f"    Created {i+1}/{len(bricks)} bricks...")
 
+    # RadialBrickGeometry always generates around (0,0,z).
+    # If the source face has a non-zero XY center (e.g. object inside a Part
+    # container), translate all bricks to the correct world position.
+    center = face_info['center']
+    cx, cy = center.x, center.y
+    if abs(cx) > 1e-6 or abs(cy) > 1e-6:
+        offset = App.Vector(cx, cy, 0)
+        print(f"  Translating bricks by center offset ({cx:.3f}, {cy:.3f})")
+        brick_shapes = [s.translated(offset) for s in brick_shapes]
+
     return brick_shapes, metadata
 
 
