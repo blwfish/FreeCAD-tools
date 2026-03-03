@@ -6,10 +6,10 @@ Imported by:  brick_generator_macro, radial_brick_generator_macro,
               clapboard_generator, board_batten_generator, bead_board_generator,
               shingle_generator, smart_trim_generator, station_sign_generator
 
-Version: 1.0.0
+Version: 1.0.1
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,9 @@ def get_global_face(obj, face_index):
     try:
         placement = obj.getGlobalPlacement()
         if not placement.isIdentity():
-            face = face.transformGeometry(placement.toMatrix())
+            # transformGeometry() returns Part.Shape, not Part.Face.
+            # .Faces[0] recovers the proper Part.Face (with .Surface etc.)
+            face = face.transformGeometry(placement.toMatrix()).Faces[0]
     except AttributeError:
         pass  # Object doesn't support getGlobalPlacement (e.g. Sketch)
     return face
