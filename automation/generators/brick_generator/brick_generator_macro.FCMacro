@@ -1,5 +1,5 @@
 """
-Parametric Brick Generator Macro v4.3.0
+Parametric Brick Generator Macro v4.4.0
 
 Simplified UI layer that orchestrates brick generation using brick_geometry library.
 Handles FreeCAD coordinate systems, object creation, and automatic punchout generation.
@@ -7,7 +7,17 @@ Handles FreeCAD coordinate systems, object creation, and automatic punchout gene
 Openings (windows, doors): Automatically detected from face holes and punched out.
 No manual punchout step required - the generator produces fully finished bricked walls.
 
+Supports both vertical wall faces and horizontal surfaces (ledges, caps, sills).
+For horizontal faces the brick dimensions are remapped so brick rows run across the
+face (8" long) with brick_depth (3.75") as the row pitch and brick_height (2.25")
+as the extrusion depth into the surface.
+
 Version History:
+- 4.4.0 (2026-03-03): ADD: Horizontal face support (ledges, caps, sills)
+                      FIX: get_face_coordinate_system now establishes U/V in
+                           horizontal plane for faces with no Z extent
+                      CHANGE: brick_height/brick_depth swapped for horizontal faces
+                      CHANGE: get_face_coordinate_system returns 7-tuple (is_horizontal)
 - 4.3.0 (2026-03-03): FIX: Objects inside Part containers now brick at correct world position
                       REFACTOR: Global placement logic moved to shared freecad_utils library
 - 4.2.0 (2024-12-02): ADD: Global 3D grid snapping for course alignment
@@ -27,7 +37,7 @@ Version History:
                       COMPATIBLE: Works with both continuous walls and segmented bays
 - 3.0.0 (2025-11-26): Initial release with bond patterns
 
-Version: 4.3.0
+Version: 4.4.0
 Date: 2026-03-03
 """
 
@@ -410,15 +420,22 @@ def generate_segmented_bricks(u_length, v_length, brick_width, brick_height, bri
 def get_face_coordinate_system(face):
     """
     Establish a coordinate system for the face using bounding box analysis.
-    
+
     Returns:
-        tuple: (origin, u_vec, v_vec, normal, u_length, v_length)
-    
-    Coordinate system:
-    - origin: lowest corner of bounding box
-    - u_vec: direction of largest extent (typically horizontal)
-    - v_vec: direction of vertical extent (must include Z component)
-    - normal: perpendicular to wall (from face)
+        tuple: (origin, u_vec, v_vec, normal, u_length, v_length, is_horizontal)
+
+    Coordinate system for vertical faces:
+    - u_vec: largest non-Z horizontal extent (left-right along wall)
+    - v_vec: Z axis (up)
+    - normal: perpendicular to wall (outward)
+
+    Coordinate system for horizontal faces (no Z extent, e.g. ledges/caps):
+    - u_vec: largest horizontal extent (brick length direction)
+    - v_vec: other horizontal axis (brick depth = 3.75" becomes V row pitch)
+    - normal: ±Z (outward from face)
+    - Caller must swap brick_height/brick_depth parameters for correct sizing.
+
+    is_horizontal: True if the face has no meaningful Z extent.
     """
     
     outer_wire = face.OuterWire
@@ -472,7 +489,7 @@ def get_face_coordinate_system(face):
 
     # v_vec should be the Z axis (vertical)
     # u_vec should be the largest non-Z axis that is TANGENT to the face (perpendicular to normal)
-    if z_axis and z_axis[0] > 0.001:  # Has meaningful Z extent
+    if z_axis and z_axis[0] > 0.001:  # Has meaningful Z extent — vertical face
         v_vec = z_axis[2]
         v_length = z_axis[0]
 
@@ -496,15 +513,35 @@ def get_face_coordinate_system(face):
 
         u_vec = best_u_vec
         u_length = best_u_length
-    else:
-        # No Z variation - face is horizontal (not a vertical wall)
-        raise ValueError(
-            "Selected face is horizontal (no Z extent).\n"
-            "The brick generator is designed for vertical wall faces.\n"
-            "Horizontal brick surfaces are not yet supported."
-        )
+        is_horizontal = False
 
-    return origin, u_vec, v_vec, normal, u_length, v_length
+    else:
+        # Horizontal face: normal is approximately ±Z (ledge, cap, sill, etc.)
+        # Establish U and V axes entirely in the horizontal plane.
+        #
+        # Brick dimension remapping (handled by caller):
+        #   V row pitch    = brick_depth  (3.75" — the 3D brick depth becomes the row width)
+        #   Extrusion depth = brick_height (2.25" — the brick height goes into the surface)
+        #
+        # U = largest horizontal extent (bricks run their 8" dimension along this axis)
+        # V = other horizontal axis    (3.75" per course)
+        horiz = [(rng, name, vec) for rng, name, vec in axes if name != 'z']
+        horiz.sort(reverse=True)  # Largest extent first
+
+        if len(horiz) < 2 or horiz[0][0] < 0.001:
+            raise ValueError("Selected face has no meaningful horizontal extent.")
+
+        u_vec = horiz[0][2]
+        u_length = horiz[0][0]
+        v_vec = horiz[1][2]
+        v_length = horiz[1][0] if horiz[1][0] > 0.001 else u_length
+        is_horizontal = True
+
+        print(f"  Horizontal face detected: "
+              f"U={horiz[0][1]}-axis ({u_length:.1f}mm), "
+              f"V={horiz[1][1]}-axis ({v_length:.1f}mm)")
+
+    return origin, u_vec, v_vec, normal, u_length, v_length, is_horizontal
 
 
 def scale_vector(vec, scale):
@@ -716,10 +753,16 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     common_bond_count = int(params['common_bond_count'])
                     
                     # Get face coordinate system
-                    origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
-                    
+                    origin, u_vec, v_vec, normal, u_length, v_length, is_horizontal = get_face_coordinate_system(face)
+
+                    # For horizontal faces, remap brick dimensions:
+                    #   V row pitch     = brick_depth  (3.75" — face-parallel dimension)
+                    #   Extrusion depth = brick_height (2.25" — into the surface)
+                    gen_brick_height = brick_depth if is_horizontal else brick_height
+                    gen_brick_depth  = brick_height if is_horizontal else brick_depth
+
                     # Snap origin to global grid for course alignment
-                    origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar)
+                    origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, gen_brick_height, mortar)
 
                     # Bricks extrude outward along the normal from the wall surface
                     # No origin offset needed - bricks start at wall surface
@@ -728,25 +771,29 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     print("Checking for bay boundaries...")
                     gap_threshold = 0.0005  # Half of typical fudgeFactor
                     bay_boundaries = find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold)
-                    
+
                     if len(bay_boundaries) > 0:
                         print(f"Found {len(bay_boundaries)} bay boundaries - will create segmented bricks")
                     else:
                         print("No bay boundaries detected - creating continuous brick wall")
                     print()
-                    
-                    print(f"Wall dimensions: {u_length:.1f} x {v_length:.1f} mm")
-                    print(f"Brick: {brick_width} x {brick_height} x {brick_depth} mm")
+
+                    orient = "horizontal" if is_horizontal else "vertical"
+                    print(f"Face orientation: {orient}")
+                    print(f"Face dimensions: {u_length:.1f} x {v_length:.1f} mm")
+                    print(f"Brick (W×H×D): {brick_width} x {brick_height} x {brick_depth} mm")
+                    if is_horizontal:
+                        print(f"  → horizontal remapping: row pitch={gen_brick_height:.2f}mm, depth={gen_brick_depth:.2f}mm")
                     print(f"Mortar: {mortar} mm")
                     print(f"Bond: {bond_type}")
                     if bond_type.lower() == 'common':
                         print(f"Common bond count: {common_bond_count}")
                     print()
-                    
+
                     # Generate geometry with segmentation
                     print("Generating geometry...")
                     brick_defs, metadata = generate_segmented_bricks(
-                        u_length, v_length, brick_width, brick_height, brick_depth,
+                        u_length, v_length, brick_width, gen_brick_height, gen_brick_depth,
                         mortar, bond_type, common_bond_count, bay_boundaries,
                         skin_depth=skin_depth
                     )
@@ -820,7 +867,7 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
                     
                     result_obj.GeneratorName = "brick_generator"
-                    result_obj.GeneratorVersion = "4.2.0"
+                    result_obj.GeneratorVersion = "4.4.0"
                     result_obj.SourceObject = obj_name
                     result_obj.BondType = bond_type
                     result_obj.BrickCount = len(brick_defs)
@@ -879,36 +926,42 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         print(f"\n--- Processing face {face_num}/{len(sub_elements)}: {sub_element} ---")
                         
                         # Get face coordinate system
-                        origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
-                        
+                        origin, u_vec, v_vec, normal, u_length, v_length, is_horizontal = get_face_coordinate_system(face)
+
+                        # For horizontal faces, remap brick dimensions:
+                        #   V row pitch     = brick_depth  (3.75" — face-parallel dimension)
+                        #   Extrusion depth = brick_height (2.25" — into the surface)
+                        gen_brick_height = brick_depth if is_horizontal else brick_height
+                        gen_brick_depth  = brick_height if is_horizontal else brick_depth
+
                         # Snap origin to global grid for course alignment
-                        origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, mortar)
+                        origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, gen_brick_height, mortar)
 
                         # Bricks extrude outward along the normal from the wall surface
                         # No origin offset needed - bricks start at wall surface
 
-                        # Debug coordinate system
-                        print(f"  DEBUG: u_vec={u_vec} (horizontal along wall)")
-                        print(f"  DEBUG: v_vec={v_vec} (vertical)")
-                        print(f"  DEBUG: normal={normal} (perpendicular to wall)")
-                        print(f"  DEBUG: u_vec dot normal = {u_vec.dot(normal):.4f} (should be ~0)")
+                        orient = "horizontal" if is_horizontal else "vertical"
+                        print(f"  Face orientation: {orient}")
+                        print(f"  u_vec={u_vec}, v_vec={v_vec}, normal={normal}")
+                        if is_horizontal:
+                            print(f"  Horizontal remapping: row pitch={gen_brick_height:.2f}mm, depth={gen_brick_depth:.2f}mm")
 
                         # Detect bay boundaries
-                        print("Checking for bay boundaries...")
+                        print("  Checking for bay boundaries...")
                         gap_threshold = 0.0005  # Half of typical fudgeFactor
                         outer_wire = face.OuterWire
                         bay_boundaries = find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold)
-                        
+
                         if len(bay_boundaries) > 0:
                             print(f"  Found {len(bay_boundaries)} bay boundaries")
                         else:
                             print("  No bay boundaries detected")
-                        
+
                         print(f"  Dimensions: {u_length:.1f} x {v_length:.1f} mm")
-                        
+
                         # Generate geometry with segmentation
                         brick_defs, metadata = generate_segmented_bricks(
-                            u_length, v_length, brick_width, brick_height, brick_depth,
+                            u_length, v_length, brick_width, gen_brick_height, gen_brick_depth,
                             mortar, bond_type, common_bond_count, bay_boundaries,
                             skin_depth=skin_depth
                         )
@@ -995,7 +1048,7 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
                         
                         result_obj.GeneratorName = "brick_generator"
-                        result_obj.GeneratorVersion = "4.2.0"
+                        result_obj.GeneratorVersion = "4.4.0"
                         result_obj.SourceObject = obj_name
                         result_obj.SourceFaces = ", ".join(faces_processed)
                         result_obj.BondType = bond_type

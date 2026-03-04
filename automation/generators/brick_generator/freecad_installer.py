@@ -6,7 +6,7 @@ Usage:
     python3 freecad_installer.py          # standalone
     Execute via Macro menu inside FreeCAD
 
-Version: 5.1.0
+Version: 5.2.0
 """
 
 import os
@@ -16,7 +16,7 @@ import shutil
 import platform
 from pathlib import Path
 
-GENERATOR_VERSION = "5.1.0"
+GENERATOR_VERSION = "5.2.0"
 
 
 def get_macro_dir():
