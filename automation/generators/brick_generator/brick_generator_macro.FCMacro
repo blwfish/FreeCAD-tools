@@ -1,18 +1,33 @@
 """
-Parametric Brick Generator Macro v4.4.0
+Parametric Brick Generator Macro v5.0.0
 
 Simplified UI layer that orchestrates brick generation using brick_geometry library.
-Handles FreeCAD coordinate systems, object creation, and automatic punchout generation.
+Handles FreeCAD coordinate systems and directly modifies the source wall body.
 
-Openings (windows, doors): Automatically detected from face holes and punched out.
-No manual punchout step required - the generator produces fully finished bricked walls.
+Two-step engraving approach:
+  1. SHAVE: Selected faces are recessed inward by skin_depth (material_thickness).
+  2. ENGRAVE: Brick-shaped pockets are cut into the recessed face by mortar_depth,
+     leaving thin ridges (mortar lines) at the recessed surface.
+
+Benefits over the old outward-extrusion approach:
+  - No boundary trimming needed (pockets beyond the wall cut nothing)
+  - No opening punchout needed (wall has no material at windows/doors)
+  - Corners fit properly (no protruding brick surfaces)
+  - Net wall thickness unchanged after bricking
+  - Modifies the wall body in-place (no separate brick compound)
 
 Supports both vertical wall faces and horizontal surfaces (ledges, caps, sills).
-For horizontal faces the brick dimensions are remapped so brick rows run across the
-face (8" long) with brick_depth (3.75") as the row pitch and brick_height (2.25")
-as the extrusion depth into the surface.
 
 Version History:
+- 5.0.0 (2026-03-03): CHANGE: Engraved mortar approach replaces outward extrusion
+                      Bricks are now cut INTO the wall as shallow pockets
+                      REMOVED: Boundary trimming, opening punchout (not needed)
+                      REMOVED: Separate BrickedWall compound (wall is modified in-place)
+                      ADD: mortar_depth parameter (mortarDepth spreadsheet alias)
+- 4.5.0 (2026-03-03): ADD: Face recess — cuts skin_depth from wall before bricking
+                      so brick surfaces are flush with original wall plane
+                      FIX: Corners now fit properly (no protruding brick surfaces)
+                      FIX: Net wall thickness unchanged after bricking
 - 4.4.0 (2026-03-03): ADD: Horizontal face support (ledges, caps, sills)
                       FIX: get_face_coordinate_system now establishes U/V in
                            horizontal plane for faces with no Z extent
@@ -97,6 +112,112 @@ except ImportError:
         return face
     def log_global_placement(obj, label=None):
         pass
+
+
+def recess_faces(sel_obj, sub_elements, skin_depth):
+    """
+    Recess selected faces inward by skin_depth so bricks end up flush with the
+    original wall surface instead of protruding outward.
+
+    For each face:
+      1. Duplicate using OuterWire only (fills openings)
+      2. Extrude inward along -normal by skin_depth
+      3. Boolean cut from the source body
+
+    All faces are compounded into a single cut to minimize boolean operations.
+
+    After the cut, face indices shift. This function re-identifies each
+    original face in the new topology by matching normal direction and
+    centroid proximity, returning an updated sub_elements list.
+
+    Args:
+        sel_obj: The selected FreeCAD object whose shape will be modified
+        sub_elements: List of face sub-element names (e.g. ['Face1', 'Face3'])
+        skin_depth: Depth to recess (mm), typically material_thickness
+
+    Returns:
+        list: Updated sub_element names mapping to the recessed faces,
+              or None if recess failed
+    """
+    recess_solids = []
+
+    # Record each face's identity before the cut so we can re-find them after
+    face_signatures = []  # (sub_element, normal, centroid, area)
+    for sub_element in sub_elements:
+        face_index = int(sub_element.replace('Face', '')) - 1
+        face = get_global_face(sel_obj, face_index)
+
+        normal = face.normalAt(0, 0)
+        centroid = face.CenterOfMass
+        area = face.Area
+        face_signatures.append((sub_element, normal, centroid, area))
+
+        # Create solid face from outer wire only (fills window/door openings)
+        outer_wire = face.OuterWire
+        solid_face = Part.Face(outer_wire)
+
+        # Extrude inward (opposite to normal) by skin_depth
+        inward_vec = scale_vector(normal, -skin_depth)
+        recess_solid = solid_face.extrude(inward_vec)
+
+        recess_solids.append(recess_solid)
+
+    if not recess_solids:
+        return None
+
+    # Compound all recess volumes and cut from body in one operation
+    if len(recess_solids) == 1:
+        recess_shape = recess_solids[0]
+    else:
+        # Fuse all recess volumes so we do a single boolean cut
+        recess_shape = recess_solids[0]
+        for solid in recess_solids[1:]:
+            recess_shape = recess_shape.fuse(solid)
+
+    try:
+        new_shape = sel_obj.Shape.cut(recess_shape)
+        if new_shape.isNull():
+            print("  WARNING: Recess cut returned null shape, skipping recess")
+            return None
+        sel_obj.Shape = new_shape
+    except Exception as e:
+        print(f"  WARNING: Recess cut failed: {e}")
+        return None
+
+    # Re-identify faces after the boolean changed topology.
+    # The recessed face has the same normal as the original but its centroid
+    # shifted inward by skin_depth along -normal. Match by normal direction
+    # and closest area (the recessed face keeps the same area).
+    new_sub_elements = []
+    for orig_name, orig_normal, orig_centroid, orig_area in face_signatures:
+        # Expected centroid of the recessed face
+        expected_centroid = orig_centroid + scale_vector(orig_normal, -skin_depth)
+
+        best_idx = None
+        best_dist = float('inf')
+        for i, new_face in enumerate(sel_obj.Shape.Faces):
+            new_normal = new_face.normalAt(0, 0)
+            # Normal must match direction (dot product ~1.0)
+            if orig_normal.dot(new_normal) < 0.99:
+                continue
+            # Area must be similar (within 10%)
+            if abs(new_face.Area - orig_area) / orig_area > 0.10:
+                continue
+            # Pick closest centroid to expected position
+            dist = expected_centroid.distanceToPoint(new_face.CenterOfMass)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        if best_idx is not None:
+            new_name = f"Face{best_idx + 1}"
+            print(f"  Face remapped: {orig_name} → {new_name} (dist={best_dist:.4f}mm)")
+            new_sub_elements.append(new_name)
+        else:
+            print(f"  WARNING: Could not re-identify {orig_name} after recess, keeping original")
+            new_sub_elements.append(orig_name)
+
+    return new_sub_elements
 
 
 def detect_openings_and_create_punchout(face, origin, u_vec, v_vec, normal, brick_depth):
@@ -248,19 +369,22 @@ def snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, 
     return snapped_origin
 
 
-def find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold=0.0005):
+def find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold=0.0005, max_gap=0.5):
     """
     Find vertical gaps in the outer wire that represent bay boundaries.
-    
+
     This detects discontinuities in the wall face where bays are separated
     by small gaps (typically fudgeFactor-sized, ~0.001mm) after fusing arrays.
-    
+
     Args:
         outer_wire: Face outer wire to analyze
         u_vec: Horizontal axis direction vector
-        v_vec: Vertical axis direction vector  
+        v_vec: Vertical axis direction vector
         gap_threshold: Minimum gap size to consider a boundary (mm)
-        
+        max_gap: Maximum gap size to consider a boundary (mm).
+                 Gaps larger than this are face-spanning spans, not
+                 fuse-artifact boundaries.
+
     Returns:
         List of positions along u_vec where boundaries are detected
     """
@@ -314,8 +438,8 @@ def find_bay_boundaries(outer_wire, u_vec, v_vec, gap_threshold=0.0005):
         u2 = vertical_edges[i + 1]['u_pos']
         gap = u2 - u1
         
-        # If gap is larger than threshold, this is a bay boundary
-        if gap > gap_threshold:
+        # If gap is within the bay-boundary range, this is a fuse artifact
+        if gap > gap_threshold and gap < max_gap:
             # Store the midpoint of the gap as the boundary
             boundary_pos = (u1 + u2) / 2
             bay_boundaries.append(boundary_pos)
@@ -577,17 +701,17 @@ def create_brick_from_def(brick_def, origin, u_vec, v_vec, normal):
     # Build 8 vertices in world space
     # Each vertex = origin + u_offset*u_vec + v_offset*v_vec + n_offset*normal
     
-    # Near face (n=0)
+    # Near face — sits on the wall surface (recessed face after shave)
     p0 = origin + scale_vector(u_vec, u_pos) + scale_vector(v_vec, v_pos)
     p1 = origin + scale_vector(u_vec, u_pos + width) + scale_vector(v_vec, v_pos)
     p2 = origin + scale_vector(u_vec, u_pos + width) + scale_vector(v_vec, v_pos + height)
     p3 = origin + scale_vector(u_vec, u_pos) + scale_vector(v_vec, v_pos + height)
-    
-    # Far face (n=depth)
-    p4 = p0 + scale_vector(normal, depth)
-    p5 = p1 + scale_vector(normal, depth)
-    p6 = p2 + scale_vector(normal, depth)
-    p7 = p3 + scale_vector(normal, depth)
+
+    # Far face — extrudes INWARD (into wall) by depth
+    p4 = p0 + scale_vector(normal, -depth)
+    p5 = p1 + scale_vector(normal, -depth)
+    p6 = p2 + scale_vector(normal, -depth)
+    p7 = p3 + scale_vector(normal, -depth)
     
     # Create the 12 edges
     e0 = Part.Edge(Part.LineSegment(p0, p1).toShape())
@@ -670,6 +794,7 @@ _BRICK_PARAM_DEFAULTS = {
     'bond_type':          ('stretcher', 'bondType',         'stretcher/english/flemish/common'),
     'common_bond_count':  (5,           'commonBondCount',  'header courses for common bond'),
     'material_thickness': (0.3,         'materialThickness','mm  rendered skin depth'),
+    'mortar_depth':       (0.06,        'mortarDepth',      'mm  mortar groove depth (engraved)'),
 }
 
 
@@ -867,7 +992,7 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                     result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
                     
                     result_obj.GeneratorName = "brick_generator"
-                    result_obj.GeneratorVersion = "4.4.0"
+                    result_obj.GeneratorVersion = "5.0.0"
                     result_obj.SourceObject = obj_name
                     result_obj.BondType = bond_type
                     result_obj.BrickCount = len(brick_defs)
@@ -908,7 +1033,8 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                 mortar = params['mortar']
                 bond_type = params['bond_type']
                 common_bond_count = int(params['common_bond_count'])
-                
+                mortar_depth = params['mortar_depth']
+
                 # Collect all brick shapes from all faces
                 all_brick_shapes = []
                 total_brick_count = 0
@@ -917,14 +1043,28 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                 # Log if object is inside a Part container with a non-identity placement
                 log_global_placement(sel_obj)
 
-                # Process each selected face
+                # Recess selected faces inward so bricks end up flush with original surface
+                print("Recessing faces inward by {:.3f}mm...".format(skin_depth))
+                new_sub_elements = recess_faces(sel_obj, sub_elements, skin_depth)
+                if new_sub_elements is not None:
+                    sub_elements = new_sub_elements
+                    print(f"  ✓ Faces recessed by {skin_depth:.3f}mm")
+                else:
+                    print("  WARNING: Face recess failed, bricks will protrude outward")
+
+                # Process each selected face — generate brick solids that
+                # extrude INWARD from the recessed face by mortar_depth.
+                # These are then boolean-cut from the wall body to engrave
+                # mortar grooves.  No boundary trimming or punchout needed:
+                # pockets beyond the wall boundary cut nothing, and openings
+                # already have no material.
                 for face_num, sub_element in enumerate(sub_elements, 1):
                     try:
                         face_index = int(sub_element.replace('Face', '')) - 1
                         face = get_global_face(sel_obj, face_index)
-                        
+
                         print(f"\n--- Processing face {face_num}/{len(sub_elements)}: {sub_element} ---")
-                        
+
                         # Get face coordinate system
                         origin, u_vec, v_vec, normal, u_length, v_length, is_horizontal = get_face_coordinate_system(face)
 
@@ -936,9 +1076,6 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
 
                         # Snap origin to global grid for course alignment
                         origin = snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, gen_brick_height, mortar)
-
-                        # Bricks extrude outward along the normal from the wall surface
-                        # No origin offset needed - bricks start at wall surface
 
                         orient = "horizontal" if is_horizontal else "vertical"
                         print(f"  Face orientation: {orient}")
@@ -960,61 +1097,40 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         print(f"  Dimensions: {u_length:.1f} x {v_length:.1f} mm")
 
                         # Generate geometry with segmentation
+                        # Pass mortar_depth as skin_depth so BrickDef.depth = mortar_depth
                         brick_defs, metadata = generate_segmented_bricks(
                             u_length, v_length, brick_width, gen_brick_height, gen_brick_depth,
                             mortar, bond_type, common_bond_count, bay_boundaries,
-                            skin_depth=skin_depth
+                            skin_depth=mortar_depth
                         )
-                        
+
                         print(f"  Generated {len(brick_defs)} brick definitions")
-                        
-                        # Create FreeCAD brick shapes for this face
+
+                        # Create FreeCAD brick shapes (extruded inward by mortar_depth)
                         face_brick_shapes = []
                         for brick_def in brick_defs:
                             brick = create_brick_from_def(brick_def, origin, u_vec, v_vec, normal)
                             face_brick_shapes.append(brick)
-                        
-                        # Create compound for this face
-                        face_compound = Part.Compound(face_brick_shapes)
-                        
-                        # Detect openings in the face
-                        punchout_shape = detect_openings_and_create_punchout(
-                            face, origin, u_vec, v_vec, normal, brick_depth
-                        )
-                        
-                        # Perform boolean cut if punchouts exist
-                        if punchout_shape:
-                            print("  Cutting openings...")
-                            try:
-                                face_compound = face_compound.cut(punchout_shape)
-                                if not face_compound.isNull():
-                                    print(f"  ✓ Openings cut")
-                                else:
-                                    face_compound = Part.Compound(face_brick_shapes)
-                            except Exception as e:
-                                print(f"  WARNING: Opening cut failed: {e}")
-                                face_compound = Part.Compound(face_brick_shapes)
-                        
-                        # Trim bricks to face boundary
-                        print("  Trimming to boundary...")
-                        try:
-                            boundary_depth = 20.0  # mm
-                            boundary_vec = scale_vector(normal, boundary_depth * 2)
-                            boundary_start = scale_vector(normal, -boundary_depth)
-                            face_translated = face.translated(boundary_start)
-                            boundary_cutter = face_translated.extrude(boundary_vec)
-                            face_compound = face_compound.common(boundary_cutter)
-                            print(f"  ✓ Trimmed to boundary")
-                        except Exception as e:
-                            print(f"  WARNING: Boundary trimming failed: {e}")
-                        
-                        # Add this face's bricks to the collection
-                        all_brick_shapes.append(face_compound)
+
+                        brick_compound = Part.Compound(face_brick_shapes)
+
+                        # Build mortar grid = face slab minus bricks.
+                        # The slab covers the whole face extruded inward by mortar_depth.
+                        # Subtracting brick shapes leaves only the thin mortar lines.
+                        # Cutting the mortar grid from the wall gives: mortar recessed,
+                        # bricks proud (the original recessed surface).
+                        slab_vec = scale_vector(normal, -mortar_depth)
+                        face_slab = face.extrude(slab_vec)
+                        mortar_grid = face_slab.cut(brick_compound)
+                        print(f"  ✓ Mortar grid created (slab - {len(brick_defs)} bricks)")
+
+                        # Add to collection
+                        all_brick_shapes.append(mortar_grid)
                         total_brick_count += len(brick_defs)
                         faces_processed.append(sub_element)
-                        
-                        print(f"  ✓ Face {sub_element} complete")
-                        
+
+                        print(f"  ✓ Face {sub_element} complete ({len(brick_defs)} bricks)")
+
                     except Exception as e:
                         print(f"\n{'='*60}")
                         print(f"ERROR processing {sub_element}: {e}")
@@ -1022,55 +1138,40 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         import traceback
                         traceback.print_exc()
                         continue
-                
-                # Create final compound of all faces
+
+                # Engrave mortar grooves: cut mortar grids from the wall
                 if all_brick_shapes:
                     print(f"\n{'='*60}")
-                    print(f"Creating final compound from {len(faces_processed)} face(s)...")
+                    print(f"Engraving mortar grooves for {total_brick_count} bricks on {len(faces_processed)} face(s)...")
                     print(f"{'='*60}")
-                    
+
                     try:
                         if len(all_brick_shapes) == 1:
-                            final_shape = all_brick_shapes[0]
+                            mortar_compound = all_brick_shapes[0]
                         else:
-                            final_shape = Part.Compound(all_brick_shapes)
-                        
-                        # Create result object
-                        result_obj = doc.addObject("Part::Feature", f"BrickedWall_{obj_name}")
-                        result_obj.Shape = final_shape
-                        
-                        # Add metadata
-                        result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
-                        result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
-                        result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
-                        result_obj.addProperty("App::PropertyString", "SourceFaces", "Metadata", "Source faces")
-                        result_obj.addProperty("App::PropertyString", "BondType", "Metadata", "Bond pattern used")
-                        result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
-                        
-                        result_obj.GeneratorName = "brick_generator"
-                        result_obj.GeneratorVersion = "4.4.0"
-                        result_obj.SourceObject = obj_name
-                        result_obj.SourceFaces = ", ".join(faces_processed)
-                        result_obj.BondType = bond_type
-                        result_obj.BrickCount = total_brick_count
-                        
-                        doc.recompute()
-                        
-                        print()
-                        print(f"✓ Created: {result_obj.Label}")
-                        print(f"  Total bricks: {total_brick_count}")
-                        print(f"  Faces processed: {len(faces_processed)}")
-                        print(f"  Bond type: {bond_type}")
-                        if punchout_shape:
-                            print(f"  Openings: Punched and cut")
-                        print()
-                        print(f"{'='*60}")
-                        print(f"SUCCESS!")
-                        print(f"{'='*60}")
-                        
+                            mortar_compound = Part.Compound(all_brick_shapes)
+
+                        new_shape = sel_obj.Shape.cut(mortar_compound)
+                        if new_shape.isNull():
+                            print("ERROR: Boolean cut returned null shape")
+                        else:
+                            sel_obj.Shape = new_shape
+                            doc.recompute()
+
+                            print()
+                            print(f"✓ Engraved mortar on: {obj_name}")
+                            print(f"  Total bricks: {total_brick_count}")
+                            print(f"  Faces processed: {len(faces_processed)}")
+                            print(f"  Bond type: {bond_type}")
+                            print(f"  Mortar depth: {mortar_depth:.3f}mm")
+                            print()
+                            print(f"{'='*60}")
+                            print(f"SUCCESS!")
+                            print(f"{'='*60}")
+
                     except Exception as e:
                         print(f"\n{'='*60}")
-                        print(f"ERROR creating final compound: {e}")
+                        print(f"ERROR engraving mortar: {e}")
                         print(f"{'='*60}")
                         import traceback
                         traceback.print_exc()
