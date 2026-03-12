@@ -1,11 +1,16 @@
 """
-Roof Seam Generator for FreeCAD v1.0.1
+Roof Seam Generator for FreeCAD v1.1.0
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.1.0: Auto-unwrap ShingledRoof compounds via BaseObject so the macro works
+         when the user clicks on individual shingle faces rather than the
+         original roof faces. resolve_shared_edge() tries raw faces first,
+         then falls back to all BaseObject-face pairs.
+- 1.0.2: Add face vertex/edge diagnostic dump to "no shared edge" error.
 - 1.0.1: Replace sys.exit() with if/else (FreeCAD macro best practice).
          Add raw selection dump to the "wrong face count" error so the cause
          (e.g. selection cleared by Macros dialog, or whole-object selected
@@ -40,7 +45,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -155,6 +160,63 @@ def classify_seam(face1, face2, shared_edge):
         return 'valley'
     else:
         return 'hip'
+
+
+def resolve_shared_edge(face1, obj1, face2, obj2):
+    """
+    Find the shared edge between two faces, automatically unwrapping
+    ShingledRoof compounds to their BaseObject faces when needed.
+
+    When the user clicks on shingles (not on the original roof geometry),
+    the selected faces are individual shingle-box faces from a ShingledRoof
+    compound.  Those shingles don't share edges with each other.  But the
+    compound has a BaseObject property pointing to the original roof shape
+    whose faces DO share the hip/valley edge.
+
+    Strategy:
+      1. Try the raw selected faces (fast path — works if user selected from
+         the original roof geometry).
+      2. If that fails and either object is a ShingledRoof compound, collect
+         all faces of each BaseObject and try every pair.
+
+    Returns:
+        (shared_edge, resolved_face1, resolved_obj1, resolved_face2, resolved_obj2)
+        or (None, face1, obj1, face2, obj2) if no shared edge found.
+    """
+    # Fast path: raw faces share an edge directly
+    edge = find_shared_edge(face1, face2)
+    if edge is not None:
+        return edge, face1, obj1, face2, obj2
+
+    # Build candidate face lists, expanding compounds to their BaseObject
+    def candidates(face, obj):
+        result = [(face, obj)]
+        if (obj.TypeId == 'Part::Compound'
+                and hasattr(obj, 'BaseObject')
+                and obj.BaseObject is not None):
+            base = obj.BaseObject
+            App.Console.PrintMessage(
+                f"  Unwrapping {obj.Name} → BaseObject={base.Name}"
+                f" ({len(base.Shape.Faces)} face(s))\n"
+            )
+            result += [(f, base) for f in base.Shape.Faces]
+        return result
+
+    cands1 = candidates(face1, obj1)
+    cands2 = candidates(face2, obj2)
+
+    for f1, o1 in cands1:
+        for f2, o2 in cands2:
+            if f1 is face1 and f2 is face2:
+                continue  # already tried above
+            edge = find_shared_edge(f1, f2)
+            if edge is not None:
+                App.Console.PrintMessage(
+                    f"  Found shared edge via BaseObject resolution\n"
+                )
+                return edge, f1, o1, f2, o2
+
+    return None, face1, obj1, face2, obj2
 
 
 def face_normal_at_center(face):
@@ -371,14 +433,17 @@ if __name__ == "__main__":
                 face1, obj1 = selected_faces[0]
                 face2, obj2 = selected_faces[1]
 
-                # --- Find shared edge ---
+                # --- Find shared edge (with automatic ShingledRoof unwrapping) ---
                 App.Console.PrintMessage("Finding shared edge...\n")
-                shared_edge = find_shared_edge(face1, face2)
+                shared_edge, face1, obj1, face2, obj2 = resolve_shared_edge(
+                    face1, obj1, face2, obj2
+                )
 
                 if shared_edge is None:
                     App.Console.PrintError(
-                        "ERROR: No shared edge found between the two selected faces.\n"
-                        "Make sure you select two adjacent faces that share an edge.\n\n"
+                        "ERROR: No shared edge found between the two selected faces"
+                        " (or their BaseObjects).\n"
+                        "Make sure you select two adjacent roof faces that share an edge.\n\n"
                     )
 
                 else:
