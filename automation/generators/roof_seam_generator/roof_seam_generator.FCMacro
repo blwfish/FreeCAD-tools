@@ -1,11 +1,17 @@
 """
-Roof Seam Generator for FreeCAD v1.1.1
+Roof Seam Generator for FreeCAD v1.1.2
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.1.2: Fix face-matching metric in closest_base_face(). Centroid-to-centroid
+         distance was picking eave/soffit faces instead of slope faces for
+         shingles near the hip seam. Now uses distToShape() (point-to-surface
+         distance): the shingle's centroid lies on the slope surface it was
+         generated from, so surface dist ≈ 0 for the correct face and >> 0
+         for all others.
 - 1.1.1: Fix wrong-seam selection when both ShingledRoof compounds share the
          same BaseObject (e.g. two slopes of the same roof solid). The old
          brute-force search over all BaseObject face pairs found the first
@@ -52,7 +58,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -171,19 +177,29 @@ def classify_seam(face1, face2, shared_edge):
 
 def closest_base_face(orig_face, base_faces):
     """
-    Return the face in base_faces whose centroid is closest to orig_face's
-    centroid.  Used to map a selected shingle face back to the roof-plane
-    face it was generated from.
+    Return the face in base_faces whose SURFACE is closest to orig_face's
+    centroid point.
+
+    The shingle was extruded from the roof slope, so its centroid lies
+    essentially on (or very near) that slope's surface — surface distance
+    ≈ 0.  Centroid-to-centroid distance is unreliable because a small
+    shingle near an edge can be much farther from the slope-face centre than
+    from the centre of an adjacent eave/soffit face.
     """
     orig_center = orig_face.CenterOfMass
+    test_vtx = Part.Vertex(orig_center)
     best = None
     best_dist = float('inf')
     for f in base_faces:
-        d = orig_center.distanceToPoint(f.CenterOfMass)
+        try:
+            d = f.distToShape(test_vtx)[0]
+        except Exception:
+            # Fall back to centroid distance if distToShape fails
+            d = orig_center.distanceToPoint(f.CenterOfMass)
         if d < best_dist:
             best_dist = d
             best = f
-    App.Console.PrintMessage(f"    → best base face centroid dist: {best_dist:.3f} mm\n")
+    App.Console.PrintMessage(f"    → best base face surface dist: {best_dist:.4f} mm\n")
     return best
 
 
