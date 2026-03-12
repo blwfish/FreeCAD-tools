@@ -1,11 +1,18 @@
 """
-Roof Seam Generator for FreeCAD v1.1.0
+Roof Seam Generator for FreeCAD v1.1.1
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.1.1: Fix wrong-seam selection when both ShingledRoof compounds share the
+         same BaseObject (e.g. two slopes of the same roof solid). The old
+         brute-force search over all BaseObject face pairs found the first
+         shared edge in the solid rather than the one near the selected
+         shingles. Now uses centroid proximity to map each selected shingle
+         face to its closest BaseObject roof-plane face, then checks only
+         that specific pair.
 - 1.1.0: Auto-unwrap ShingledRoof compounds via BaseObject so the macro works
          when the user clicks on individual shingle faces rather than the
          original roof faces. resolve_shared_edge() tries raw faces first,
@@ -45,7 +52,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -162,6 +169,24 @@ def classify_seam(face1, face2, shared_edge):
         return 'hip'
 
 
+def closest_base_face(orig_face, base_faces):
+    """
+    Return the face in base_faces whose centroid is closest to orig_face's
+    centroid.  Used to map a selected shingle face back to the roof-plane
+    face it was generated from.
+    """
+    orig_center = orig_face.CenterOfMass
+    best = None
+    best_dist = float('inf')
+    for f in base_faces:
+        d = orig_center.distanceToPoint(f.CenterOfMass)
+        if d < best_dist:
+            best_dist = d
+            best = f
+    App.Console.PrintMessage(f"    → best base face centroid dist: {best_dist:.3f} mm\n")
+    return best
+
+
 def resolve_shared_edge(face1, obj1, face2, obj2):
     """
     Find the shared edge between two faces, automatically unwrapping
@@ -176,8 +201,11 @@ def resolve_shared_edge(face1, obj1, face2, obj2):
     Strategy:
       1. Try the raw selected faces (fast path — works if user selected from
          the original roof geometry).
-      2. If that fails and either object is a ShingledRoof compound, collect
-         all faces of each BaseObject and try every pair.
+      2. If either object is a ShingledRoof compound, find the single
+         BaseObject face closest (by centroid) to each selected shingle face,
+         then check just that pair.  Proximity correctly maps each shingle to
+         the roof plane it sits on — avoiding the wrong-edge problem that
+         occurs when brute-forcing all face pairs of the same base solid.
 
     Returns:
         (shared_edge, resolved_face1, resolved_obj1, resolved_face2, resolved_obj2)
@@ -188,9 +216,8 @@ def resolve_shared_edge(face1, obj1, face2, obj2):
     if edge is not None:
         return edge, face1, obj1, face2, obj2
 
-    # Build candidate face lists, expanding compounds to their BaseObject
-    def candidates(face, obj):
-        result = [(face, obj)]
+    # Unwrap each compound to its single best-matching BaseObject face
+    def get_base(face, obj):
         if (obj.TypeId == 'Part::Compound'
                 and hasattr(obj, 'BaseObject')
                 and obj.BaseObject is not None):
@@ -199,22 +226,17 @@ def resolve_shared_edge(face1, obj1, face2, obj2):
                 f"  Unwrapping {obj.Name} → BaseObject={base.Name}"
                 f" ({len(base.Shape.Faces)} face(s))\n"
             )
-            result += [(f, base) for f in base.Shape.Faces]
-        return result
+            return closest_base_face(face, base.Shape.Faces), base
+        return face, obj
 
-    cands1 = candidates(face1, obj1)
-    cands2 = candidates(face2, obj2)
+    f1, o1 = get_base(face1, obj1)
+    f2, o2 = get_base(face2, obj2)
 
-    for f1, o1 in cands1:
-        for f2, o2 in cands2:
-            if f1 is face1 and f2 is face2:
-                continue  # already tried above
-            edge = find_shared_edge(f1, f2)
-            if edge is not None:
-                App.Console.PrintMessage(
-                    f"  Found shared edge via BaseObject resolution\n"
-                )
-                return edge, f1, o1, f2, o2
+    if f1 is not face1 or f2 is not face2:
+        edge = find_shared_edge(f1, f2)
+        if edge is not None:
+            App.Console.PrintMessage("  Found shared edge via BaseObject resolution\n")
+            return edge, f1, o1, f2, o2
 
     return None, face1, obj1, face2, obj2
 
