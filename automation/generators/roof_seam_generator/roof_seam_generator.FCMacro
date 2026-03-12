@@ -1,11 +1,16 @@
 """
-Roof Seam Generator for FreeCAD v1.5.0
+Roof Seam Generator for FreeCAD v1.5.1
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.5.1: Fix taper direction for inward-Z halves. When outward=False the Z
+         axis points into the roof, so the Z=0 face is the visible exterior.
+         make_tapered_box() now accepts taper_top: True puts taper on Z=max
+         (outward case), False puts taper on Z=0 (inward case) so the
+         shadow-line is always on the exterior face.
 - 1.5.0: Replace cumulative stagger with tapered cap profile. Each cap is
          a wedge: full mat_thick at the exposed butt edge, tapering to 20%
          at the covered top edge. The taper creates a visible shadow-line
@@ -93,7 +98,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -313,26 +318,41 @@ def make_rotation_matrix(x_axis, y_axis, z_axis):
     )
 
 
-def make_tapered_box(width, height, butt_thick, top_thick):
+def make_tapered_box(width, height, butt_thick, top_thick, taper_top=True):
     """
     Create a box tapered in Z along the Y axis.
 
     At Y=0 (the exposed butt edge) the box is butt_thick tall.
     At Y=height (the covered top edge) it is top_thick tall.
-    Bottom face lies in the Z=0 plane.
+
+    taper_top=True  (outward Z): flat bottom at Z=0, top tapers down.
+    taper_top=False (inward Z):  flat top at Z=butt_thick, bottom tapers up.
 
     This taper creates the visible shadow-line at each butt edge
     that makes individual shingles/caps distinguishable in STL export,
     without needing cumulative stagger.
     """
-    p0 = Vector(0, 0, 0)
-    p1 = Vector(width, 0, 0)
-    p2 = Vector(width, height, 0)
-    p3 = Vector(0, height, 0)
-    p4 = Vector(0, 0, butt_thick)
-    p5 = Vector(width, 0, butt_thick)
-    p6 = Vector(width, height, top_thick)
-    p7 = Vector(0, height, top_thick)
+    if taper_top:
+        # Standard: flat bottom, tapered top
+        p0 = Vector(0, 0, 0)
+        p1 = Vector(width, 0, 0)
+        p2 = Vector(width, height, 0)
+        p3 = Vector(0, height, 0)
+        p4 = Vector(0, 0, butt_thick)
+        p5 = Vector(width, 0, butt_thick)
+        p6 = Vector(width, height, top_thick)
+        p7 = Vector(0, height, top_thick)
+    else:
+        # Reversed: flat top, tapered bottom (taper visible on Z=0 face)
+        taper_rise = butt_thick - top_thick
+        p0 = Vector(0, 0, 0)
+        p1 = Vector(width, 0, 0)
+        p2 = Vector(width, height, taper_rise)
+        p3 = Vector(0, height, taper_rise)
+        p4 = Vector(0, 0, butt_thick)
+        p5 = Vector(width, 0, butt_thick)
+        p6 = Vector(width, height, butt_thick)
+        p7 = Vector(0, height, butt_thick)
 
     def _face(pts):
         edges = [Part.makeLine(pts[i], pts[(i + 1) % len(pts)])
@@ -473,7 +493,7 @@ def generate_hip_caps(shared_edge, face1, face2, params):
             (clip1, rot1, outward1, n1),
             (clip2, rot2, outward2, n2),
         ]:
-            h = make_tapered_box(half_width, cap_height, butt_thick, top_thick)
+            h = make_tapered_box(half_width, cap_height, butt_thick, top_thick, taper_top=outward)
             corner = pt if outward else pt + n * butt_thick
             h.Placement = App.Placement(corner, rot)
 
