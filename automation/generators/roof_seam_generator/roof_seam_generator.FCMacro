@@ -1,11 +1,15 @@
 """
-Roof Seam Generator for FreeCAD v1.4.0
+Roof Seam Generator for FreeCAD v1.4.1
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.4.1: Fix wishbone splitting at apex. Stagger was offset along each
+         face's individual normal, so the two halves diverged as the
+         cumulative offset grew. Now offsets along the bisector of the
+         two face normals — both halves rise together.
 - 1.4.0: Stagger hip caps and close ridge channel.
          1) Each half extends mat_thick past the ridge so the two halves
             overlap at the seam, closing the V-groove between slopes.
@@ -84,7 +88,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -400,6 +404,11 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     App.Console.PrintMessage("  Face 2 half:\n")
     rot2, outward2, _ = half_cap_setup(n2, face2.CenterOfMass)
 
+    # Bisector of the two face normals — points straight out from the ridge.
+    # Used for stagger offset so both halves lift together (no wishbone).
+    bisector = n1 + n2
+    bisector = bisector * (1.0 / bisector.Length)
+
     # Clipping solids: extrude each roof face along its outward normal.
     # Boolean-intersecting each half-cap with the clip solid trims caps that
     # overhang the eave at the bottom of a hip seam.
@@ -418,9 +427,9 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     t = 0.0
     while t < edge_len:
         pt = start_pt + edge_dir * t
-        # Stagger: each cap sits mat_thick above the previous one.
-        # cap_idx=0 is at eave (base level), highest index is at apex (top).
-        stagger = cap_idx * mat_thick
+        # Stagger: each cap pair sits mat_thick above the previous pair,
+        # offset along the bisector so both halves rise together.
+        stagger_vec = bisector * (cap_idx * mat_thick)
 
         for clip, rot, outward, n in [
             (clip1, rot1, outward1, n1),
@@ -428,9 +437,9 @@ def generate_hip_caps(shared_edge, face1, face2, params):
         ]:
             h = Part.makeBox(half_width, cap_height, mat_thick)
             if outward:
-                corner = pt + n * stagger
+                corner = pt + stagger_vec
             else:
-                corner = pt + n * (mat_thick + stagger)
+                corner = pt + n * mat_thick + stagger_vec
             h.Placement = App.Placement(corner, rot)
 
             trimmed = h.common(clip)
