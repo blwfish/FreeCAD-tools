@@ -1,0 +1,408 @@
+"""
+Roof Seam Generator for FreeCAD v1.0.0
+Generates hip cap shingles or valley flashing between two selected roof faces.
+
+Author: Brian (with Claude assistance)
+Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
+
+Version History:
+- 1.0.0: Initial release.
+         Auto-detects hip vs valley from Z coordinates:
+           Hip/ridge: non-shared vertices are BELOW the shared edge
+                      → cap shingles at exposure intervals straddling the edge
+           Valley: non-shared vertices are ABOVE the shared edge
+                   → single flat flashing strip along full edge length
+
+         IMPORTANT: Uses * operator (not .multiply()) for all vector scaling
+         because App.Vector.multiply() mutates the vector in place.
+
+Parameters read from spreadsheet (falls back to defaults if not found):
+    shingleWidth          — used as default for hipCapWidth
+    shingleHeight         — height of each hip cap shingle
+    materialThickness     — thickness of cap/flashing; default for valleyFlashingWidth
+    shingleExposure       — spacing between hip cap shingles
+    hipCapWidth           — width of hip cap (default: shingleWidth)
+    valleyFlashingWidth   — width of valley flashing (default: materialThickness * 8)
+
+Output:
+    HipCap_{objectName}          — compound of cap shingles (hip/ridge)
+    ValleyFlashing_{objectName}  — compound of flashing strip (valley)
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+from FreeCAD import Vector
+import math
+import sys
+
+VERSION = "1.0.0"
+GENERATOR_NAME = "roof_seam_generator"
+
+
+# ============================================================================
+# Spreadsheet parameter loading
+# ============================================================================
+
+def find_spreadsheet(doc):
+    """Find spreadsheet by name or label, following App::Link if needed."""
+    preferred_names = ["params", "ShingleParameters", "BuildingParameters", "Spreadsheet"]
+    for ss_name in preferred_names:
+        obj = doc.getObject(ss_name)
+        if obj:
+            if obj.TypeId == 'App::Link':
+                target = obj.LinkedObject
+                if target and target.TypeId == 'Spreadsheet::Sheet':
+                    return target
+            elif obj.TypeId == 'Spreadsheet::Sheet':
+                return obj
+        for obj in doc.Objects:
+            if obj.Label == ss_name:
+                if obj.TypeId == 'App::Link':
+                    target = obj.LinkedObject
+                    if target and target.TypeId == 'Spreadsheet::Sheet':
+                        return target
+                elif obj.TypeId == 'Spreadsheet::Sheet':
+                    return obj
+    return None
+
+
+def get_params_from_spreadsheet(doc):
+    """Read seam generator parameters from spreadsheet. Returns {} if not found."""
+    ss = find_spreadsheet(doc)
+    if ss is None:
+        return {}
+
+    params = {}
+    aliases = {
+        'shingleWidth':         ['shingleWidth'],
+        'shingleHeight':        ['shingleHeight'],
+        'materialThickness':    ['materialThickness'],
+        'shingleExposure':      ['shingleExposure', 'exposure'],
+        'hipCapWidth':          ['hipCapWidth'],
+        'valleyFlashingWidth':  ['valleyFlashingWidth'],
+    }
+
+    for key, names in aliases.items():
+        for name in names:
+            try:
+                val = ss.get(name)
+                if val is not None:
+                    params[key] = float(val)
+                    break
+            except Exception:
+                continue
+
+    return params
+
+
+# ============================================================================
+# Geometry helpers
+# ============================================================================
+
+def find_shared_edge(face1, face2, tol=0.01):
+    """Find the shared edge between two faces by matching endpoint positions."""
+    for e1 in face1.Edges:
+        p1a = e1.Vertexes[0].Point
+        p1b = e1.Vertexes[-1].Point
+        for e2 in face2.Edges:
+            p2a = e2.Vertexes[0].Point
+            p2b = e2.Vertexes[-1].Point
+            if ((p1a.distanceToPoint(p2a) < tol and p1b.distanceToPoint(p2b) < tol) or
+                    (p1a.distanceToPoint(p2b) < tol and p1b.distanceToPoint(p2a) < tol)):
+                return e1
+    return None
+
+
+def classify_seam(face1, face2, shared_edge):
+    """
+    Classify the shared edge as 'hip' or 'valley' using Z-coordinate analysis.
+
+    Valley: non-shared vertices are ABOVE the shared edge
+            (they're at the eaves; the shared edge is the valley bottom)
+    Hip:    non-shared vertices are BELOW the shared edge
+            (they're at the eaves; the shared edge is the hip peak or ridge)
+    """
+    edge_verts = [v.Point for v in shared_edge.Vertexes]
+    edge_max_z = max(p.z for p in edge_verts)
+
+    # Build set of positions that lie on the shared edge (rounded for tolerance)
+    shared_pts = set()
+    for p in edge_verts:
+        shared_pts.add((round(p.x, 2), round(p.y, 2), round(p.z, 2)))
+
+    non_shared_z = []
+    for face in (face1, face2):
+        for v in face.Vertexes:
+            key = (round(v.Point.x, 2), round(v.Point.y, 2), round(v.Point.z, 2))
+            if key not in shared_pts:
+                non_shared_z.append(v.Point.z)
+
+    if not non_shared_z:
+        App.Console.PrintMessage("  WARNING: Could not find non-shared vertices, defaulting to hip\n")
+        return 'hip'
+
+    avg_z = sum(non_shared_z) / len(non_shared_z)
+
+    App.Console.PrintMessage(f"  Shared edge max Z:      {edge_max_z:.3f} mm\n")
+    App.Console.PrintMessage(f"  Non-shared vertices avg Z: {avg_z:.3f} mm\n")
+
+    if avg_z > edge_max_z:
+        return 'valley'
+    else:
+        return 'hip'
+
+
+def face_normal_at_center(face):
+    """Return the face normal at its parametric center."""
+    uv = face.ParameterRange
+    u_mid = (uv[0] + uv[1]) / 2.0
+    v_mid = (uv[2] + uv[3]) / 2.0
+    return face.normalAt(u_mid, v_mid)
+
+
+def make_rotation_matrix(x_axis, y_axis, z_axis):
+    """
+    Build a rotation matrix from three orthogonal basis vectors (column convention).
+    Box local X → x_axis, local Y → y_axis, local Z → z_axis.
+    """
+    return App.Matrix(
+        x_axis.x, y_axis.x, z_axis.x, 0,
+        x_axis.y, y_axis.y, z_axis.y, 0,
+        x_axis.z, y_axis.z, z_axis.z, 0,
+        0, 0, 0, 1
+    )
+
+
+# ============================================================================
+# Cap shingle generation (hip / ridge)
+# ============================================================================
+
+def generate_hip_caps(shared_edge, face1, face2, params):
+    """
+    Generate cap shingles straddling the hip/ridge edge.
+
+    Each cap is a thin rectangular slab:
+      - Centered on the edge (width spans both roof faces)
+      - Placed at shingleExposure intervals along the edge
+      - Thickness extends outward along the bisector of the two face normals
+    """
+    cap_width    = params.get('hipCapWidth', params.get('shingleWidth', 3.5))
+    cap_height   = params.get('shingleHeight', 2.0)
+    mat_thick    = params.get('materialThickness', 0.25)
+    exposure     = params.get('shingleExposure', 1.5)
+
+    App.Console.PrintMessage(
+        f"Hip cap: width={cap_width:.2f}  height={cap_height:.2f}  "
+        f"thickness={mat_thick:.2f}  exposure={exposure:.2f}\n"
+    )
+
+    # Edge geometry
+    start_pt   = shared_edge.Vertexes[0].Point
+    end_pt     = shared_edge.Vertexes[-1].Point
+    edge_vec   = end_pt - start_pt
+    edge_len   = edge_vec.Length
+    edge_dir   = edge_vec * (1.0 / edge_len)          # unit vector along edge
+
+    # Face normals → bisector (outward from hip peak)
+    n1 = face_normal_at_center(face1)
+    n2 = face_normal_at_center(face2)
+    bisector_raw = n1 + n2
+    bisector     = bisector_raw * (1.0 / bisector_raw.Length)
+
+    # Width direction: perpendicular to edge AND bisector, spanning across the hip
+    wd_raw    = edge_dir.cross(bisector)
+    width_dir = wd_raw * (1.0 / wd_raw.Length)
+
+    App.Console.PrintMessage(
+        f"  edge_dir:  ({edge_dir.x:.3f}, {edge_dir.y:.3f}, {edge_dir.z:.3f})\n"
+        f"  bisector:  ({bisector.x:.3f}, {bisector.y:.3f}, {bisector.z:.3f})\n"
+        f"  width_dir: ({width_dir.x:.3f}, {width_dir.y:.3f}, {width_dir.z:.3f})\n"
+    )
+
+    # Rotation: box X → width_dir, box Y → edge_dir, box Z → bisector
+    rotation = App.Rotation(make_rotation_matrix(width_dir, edge_dir, bisector))
+
+    shapes = []
+    t = 0.0
+    while t < edge_len:
+        point_on_edge = start_pt + edge_dir * t
+        # Corner: back at center of edge in width direction, leading edge at t
+        corner = point_on_edge - width_dir * (cap_width / 2.0)
+
+        cap = Part.makeBox(cap_width, cap_height, mat_thick)
+        cap.Placement = App.Placement(corner, rotation)
+        shapes.append(cap)
+        t += exposure
+
+    App.Console.PrintMessage(f"  Generated {len(shapes)} hip cap shingles\n")
+    return shapes
+
+
+# ============================================================================
+# Valley flashing generation
+# ============================================================================
+
+def generate_valley_flashing(shared_edge, face1, face2, params):
+    """
+    Generate a single flat flashing strip along the valley edge.
+
+    The strip:
+      - Spans valleyFlashingWidth centered on the edge (half on each face)
+      - Runs the full length of the shared edge
+      - Thickness extends outward along the bisector of the two face normals
+    """
+    mat_thick      = params.get('materialThickness', 0.25)
+    flash_width    = params.get('valleyFlashingWidth', mat_thick * 8.0)
+
+    App.Console.PrintMessage(
+        f"Valley flashing: width={flash_width:.2f}  thickness={mat_thick:.2f}\n"
+    )
+
+    # Edge geometry
+    start_pt   = shared_edge.Vertexes[0].Point
+    end_pt     = shared_edge.Vertexes[-1].Point
+    edge_vec   = end_pt - start_pt
+    edge_len   = edge_vec.Length
+    edge_dir   = edge_vec * (1.0 / edge_len)
+
+    # Face normals → bisector
+    n1 = face_normal_at_center(face1)
+    n2 = face_normal_at_center(face2)
+    bisector_raw = n1 + n2
+    bisector     = bisector_raw * (1.0 / bisector_raw.Length)
+
+    # Width direction
+    wd_raw    = edge_dir.cross(bisector)
+    width_dir = wd_raw * (1.0 / wd_raw.Length)
+
+    # Corner: centered on edge in width direction, starts at edge start
+    corner = start_pt - width_dir * (flash_width / 2.0)
+
+    # Rotation: box X → width_dir, box Y → edge_dir, box Z → bisector
+    rotation = App.Rotation(make_rotation_matrix(width_dir, edge_dir, bisector))
+
+    strip = Part.makeBox(flash_width, edge_len, mat_thick)
+    strip.Placement = App.Placement(corner, rotation)
+
+    App.Console.PrintMessage(
+        f"  Generated flashing strip ({flash_width:.2f} x {edge_len:.2f} x {mat_thick:.2f} mm)\n"
+    )
+    return [strip]
+
+
+# ============================================================================
+# Main execution
+# ============================================================================
+
+if __name__ == "__main__":
+
+    doc = App.ActiveDocument
+    if not doc:
+        App.Console.PrintError("ERROR: No active document\n")
+        sys.exit(1)
+
+    App.Console.PrintMessage(f"\n{'='*60}\n")
+    App.Console.PrintMessage(f"Roof Seam Generator v{VERSION}\n")
+    App.Console.PrintMessage(f"{'='*60}\n\n")
+
+    # --- Load parameters ---
+    defaults = {
+        'shingleWidth':       3.5,
+        'shingleHeight':      2.0,
+        'materialThickness':  0.25,
+        'shingleExposure':    1.5,
+        # hipCapWidth:        defaults to shingleWidth inside generate_hip_caps
+        # valleyFlashingWidth: defaults to materialThickness * 8 inside generate_valley_flashing
+    }
+    sheet_params = get_params_from_spreadsheet(doc)
+    params = {**defaults, **sheet_params}
+
+    App.Console.PrintMessage("Parameters:\n")
+    for k, v in sorted(params.items()):
+        src = "(spreadsheet)" if k in sheet_params else "(default)"
+        App.Console.PrintMessage(f"  {k}: {v} {src}\n")
+    App.Console.PrintMessage("\n")
+
+    # --- Validate exposure vs height ---
+    if params.get('shingleExposure', 0) > params.get('shingleHeight', float('inf')):
+        App.Console.PrintError(
+            f"ERROR: shingleExposure ({params['shingleExposure']}) "
+            f"cannot exceed shingleHeight ({params['shingleHeight']})\n\n"
+        )
+        sys.exit(1)
+
+    # --- Get selected faces ---
+    selection = Gui.Selection.getSelectionEx()
+    selected_faces = []
+    for sel in selection:
+        if not sel.HasSubObjects:
+            continue
+        for sub in sel.SubElementNames:
+            if sub.startswith("Face"):
+                idx  = int(sub[4:]) - 1
+                face = sel.Object.Shape.Faces[idx]
+                selected_faces.append((face, sel.Object))
+
+    if len(selected_faces) != 2:
+        App.Console.PrintError(
+            f"ERROR: Select exactly 2 adjacent roof faces (got {len(selected_faces)})\n\n"
+        )
+        App.Console.PrintMessage("Usage:\n")
+        App.Console.PrintMessage("  1. Ctrl+click two adjacent roof faces\n")
+        App.Console.PrintMessage("  2. Run this macro\n\n")
+        sys.exit(1)
+
+    face1, obj1 = selected_faces[0]
+    face2, obj2 = selected_faces[1]
+
+    # --- Find shared edge ---
+    App.Console.PrintMessage("Finding shared edge...\n")
+    shared_edge = find_shared_edge(face1, face2)
+
+    if shared_edge is None:
+        App.Console.PrintError(
+            "ERROR: No shared edge found between the two selected faces.\n"
+            "Make sure you select two adjacent faces that share an edge.\n\n"
+        )
+        sys.exit(1)
+
+    App.Console.PrintMessage(f"  Found shared edge, length = {shared_edge.Length:.2f} mm\n")
+
+    # --- Classify seam type ---
+    seam_type = classify_seam(face1, face2, shared_edge)
+    App.Console.PrintMessage(f"  Seam type: {seam_type.upper()}\n\n")
+
+    # --- Generate geometry ---
+    base_name = obj1.Name
+
+    if seam_type == 'hip':
+        shapes = generate_hip_caps(shared_edge, face1, face2, params)
+        output_name = f"HipCap_{base_name}"
+    else:
+        shapes = generate_valley_flashing(shared_edge, face1, face2, params)
+        output_name = f"ValleyFlashing_{base_name}"
+
+    if not shapes:
+        App.Console.PrintError("ERROR: No geometry generated.\n")
+        sys.exit(1)
+
+    # --- Create output Part::Feature ---
+    compound = Part.Compound(shapes)
+    result = doc.addObject("Part::Feature", output_name)
+    result.Shape = compound
+
+    result.addProperty("App::PropertyString", "GeneratorName",    "Metadata", "Generator name")
+    result.GeneratorName    = GENERATOR_NAME
+
+    result.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+    result.GeneratorVersion = VERSION
+
+    result.addProperty("App::PropertyString", "SeamType",         "Metadata", "Seam type (hip or valley)")
+    result.SeamType         = seam_type
+
+    doc.recompute()
+
+    App.Console.PrintMessage(f"\n{'='*60}\n")
+    App.Console.PrintMessage(f"SUCCESS: Created '{output_name}' ({len(shapes)} piece(s))\n")
+    App.Console.PrintMessage(f"{'='*60}\n\n")
