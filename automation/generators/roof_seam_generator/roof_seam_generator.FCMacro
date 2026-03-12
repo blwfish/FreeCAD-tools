@@ -1,11 +1,15 @@
 """
-Roof Seam Generator for FreeCAD v1.2.1
+Roof Seam Generator for FreeCAD v1.3.0
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.3.0: Clip hip cap halves to roof face boundaries. Each roof face is
+         extruded by materialThickness along its normal to create a clipping
+         solid; boolean intersection trims half-caps that overhang the eave
+         at the bottom of hip seams. Caps fully outside the face are dropped.
 - 1.2.1: Fix rotation handedness bug in hip cap halves. When d is sign-flipped
          to point toward the face interior, {d, edge_dir, n} becomes left-handed,
          producing a reflection that flips one half 180°. Now computes Z axis as
@@ -67,7 +71,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -375,25 +379,40 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     App.Console.PrintMessage("  Face 2 half:\n")
     rot2, outward2, _ = half_cap_setup(n2, face2.CenterOfMass)
 
+    # Clipping solids: extrude each roof face by mat_thick along its outward
+    # normal.  Boolean-intersecting each half-cap with the clip solid trims
+    # caps that overhang the eave at the bottom of a hip seam.
+    clip1 = face1.extrude(n1 * mat_thick)
+    clip2 = face2.extrude(n2 * mat_thick)
+
     shapes = []
+    clipped_count = 0
     t = 0.0
     while t < edge_len:
         pt = start_pt + edge_dir * t
 
-        # Face1 half
-        h1 = Part.makeBox(half_width, cap_height, mat_thick)
-        corner1 = pt if outward1 else pt + n1 * mat_thick
-        h1.Placement = App.Placement(corner1, rot1)
+        for clip, rot, outward, n in [
+            (clip1, rot1, outward1, n1),
+            (clip2, rot2, outward2, n2),
+        ]:
+            h = Part.makeBox(half_width, cap_height, mat_thick)
+            corner = pt if outward else pt + n * mat_thick
+            h.Placement = App.Placement(corner, rot)
 
-        # Face2 half
-        h2 = Part.makeBox(half_width, cap_height, mat_thick)
-        corner2 = pt if outward2 else pt + n2 * mat_thick
-        h2.Placement = App.Placement(corner2, rot2)
+            trimmed = h.common(clip)
+            if trimmed.Solids:
+                shapes.append(trimmed)
+            elif trimmed.Volume > 1e-6:
+                # Non-solid but has volume (e.g. shell) — keep the shape
+                shapes.append(trimmed)
+            else:
+                clipped_count += 1
 
-        shapes.extend([h1, h2])
         t += exposure
 
-    App.Console.PrintMessage(f"  Generated {len(shapes)//2} hip cap pairs ({len(shapes)} pieces)\n")
+    if clipped_count:
+        App.Console.PrintMessage(f"  Clipped away {clipped_count} half-caps outside face boundary\n")
+    App.Console.PrintMessage(f"  Generated {len(shapes)} hip cap pieces\n")
     return shapes
 
 
