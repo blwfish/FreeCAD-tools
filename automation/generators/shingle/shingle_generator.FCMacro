@@ -1,11 +1,25 @@
 """
-Parametric Shingle Generator for FreeCAD v5.0.0
+Parametric Shingle Generator for FreeCAD v5.2.0
 Generates realistic shingles on roof surfaces from selected faces
 
 Author: Brian (with Claude assistance)
 Usage: Select one or more roof faces, run as macro in FreeCAD
 
 Version History:
+- 5.2.0: Fix fundamental orientation bug — RIGHT-HANDED rotation matrix.
+         App.Rotation() converts matrices to quaternions, which can only represent
+         proper rotations (det=+1).  The old matrix (u, -v, n) had det=-1
+         (reflection), so App.Rotation silently decomposed it into a DIFFERENT
+         rotation that flipped Y and Z axes — placing shingles inside the roof
+         with the taper on the wrong face.  Root cause of orientation bugs across
+         6+ sessions.  Fix: use (u, v, n) with det=+1, adjust profile and
+         placement to match.  Also: (1) flip inward normals before coordinate
+         system computation (shell objects from Part::Thickness), (2) default
+         wedge_thickness to 3× materialThickness for visible butt steps.
+- 5.1.0: Trapezoidal shingle profile replaces triangular wedge. Previous triangle
+         tapered to zero at the covered edge (knife edge), which meshed smooth in STL.
+         Now tapers to 20% of wedge_thickness, creating a definite step at each butt
+         edge that makes individual shingles visible in STL export.
 - 5.0.2: BUG FIX: Pick eave corner with minimum U-projection as origin so the face
          extends in the positive U direction. Previously picked first eave corner
          arbitrarily, which placed all shingles off the face when it was the right corner.
@@ -108,7 +122,7 @@ except ImportError as e:
     print("Make sure shingle_geometry.py is in the _lib subdirectory of your Macro folder")
     sys.exit(1)
 
-VERSION = "5.0.2"
+VERSION = "5.2.0"
 GENERATOR_NAME = "shingle_generator"
 
 
@@ -211,6 +225,16 @@ def get_face_coordinate_system(face):
 
     # Get face normal from FreeCAD
     fc_normal = face.normalAt(0.5, 0.5).normalize()
+
+    # v5.2.0: Ensure normal points outward BEFORE computing coordinate system.
+    # For any non-vertical roof face, the exterior normal has positive Z.
+    # Shell objects (Part::Thickness) have inner faces with inward-pointing normals;
+    # if we don't fix this before the handedness check in get_roof_coordinate_system,
+    # u_vec gets flipped to match the inward normal, creating an inconsistent
+    # coordinate system that causes every subsequent orientation to be wrong.
+    if fc_normal.z < 0:
+        fc_normal = App.Vector(-fc_normal.x, -fc_normal.y, -fc_normal.z)
+
     normal_tuple = (fc_normal.x, fc_normal.y, fc_normal.z)
 
     # Use bounding-box based coordinate system (v5.0.0)
@@ -495,7 +519,7 @@ def generate_shingles(face, base_object, params):
     shingle_thickness = params.get('materialThickness', 0.5)
     exposure = params.get('shingleExposure', 15.0)
     stagger_pattern = params.get('shingleStaggerPattern', 'half')
-    wedge_thickness = params.get('shingleWedgeThickness', shingle_thickness)
+    wedge_thickness = params.get('shingleWedgeThickness', shingle_thickness * 3)
     
     print(f"\n{'='*60}")
     print(f"Shingle Generator v{VERSION}")
@@ -509,10 +533,6 @@ def generate_shingles(face, base_object, params):
     # Get face coordinate system using bounding-box method (v5.0.0)
     # This reliably determines eave-to-ridge direction from vertex Z coordinates
     origin, u_vec, v_vec, normal, u_length, v_length = get_face_coordinate_system(face)
-
-    # v5.0.1: No automatic normal flipping - the coordinate system from
-    # get_face_coordinate_system should already be correct.
-    # The face normal direction determines which side of the roof the shingles appear on.
 
     print(f"  Orientation (v5.0.0 bounding-box method):")
     print(f"  Normal: ({normal.x:.3f}, {normal.y:.3f}, {normal.z:.3f})")
@@ -555,54 +575,69 @@ def generate_shingles(face, base_object, params):
     for row in range(num_courses):
         # Calculate stagger offset for this row (using geometry library)
         stagger = calculate_stagger_offset(row, stagger_pattern, shingle_width)
-        
+
         for col in range(shingles_per_course):
             # Start before origin to ensure full coverage
             u = col * shingle_width + stagger - max_stagger
             v = row * exposure - exposure  # Start one course below origin
-            
+
             # Calculate base position (top edge of shingle on roof surface)
             u_scaled = scale_vector(u_vec, u)
             v_scaled = scale_vector(v_vec, v)
             top_position = origin + u_scaled + v_scaled
             
-            # Build rotation matrix from target coordinate system
-            # Shingle local coords: X=width, Y=height(DOWN slope), Z=thickness(outward)
-            # Target coords: U=across, V=UP slope, Normal=outward
-            # Since local Y is down-slope but V is up-slope, we negate V in the mapping
-            # So: local X -> U, local Y -> -V, local Z -> Normal
-            neg_v_vec = App.Vector(-v_vec.x, -v_vec.y, -v_vec.z)
+            # Build RIGHT-HANDED rotation matrix (det=+1).
+            # Local X → u_vec (across roof)
+            # Local Y → v_vec (UP slope, eave→ridge)
+            # Local Z → normal (outward from roof)
+            #
+            # CRITICAL: The matrix MUST have det=+1.  App.Rotation() converts
+            # the matrix to a quaternion, which can only represent proper
+            # rotations.  A det=-1 matrix (reflection) gets silently
+            # decomposed into a different rotation, flipping Y and Z axes
+            # and producing wrong shingle orientation.  This was the root
+            # cause of orientation bugs across 6+ sessions.
             rotation_matrix = App.Matrix(
-                u_vec.x, neg_v_vec.x, normal.x, 0,
-                u_vec.y, neg_v_vec.y, normal.y, 0,
-                u_vec.z, neg_v_vec.z, normal.z, 0,
+                u_vec.x, v_vec.x, normal.x, 0,
+                u_vec.y, v_vec.y, normal.y, 0,
+                u_vec.z, v_vec.z, normal.z, 0,
                 0, 0, 0, 1
             )
             final_rotation = App.Rotation(rotation_matrix)
 
+            # Placement: local Y goes UP slope, so Y=0 is the eaveward
+            # (butt) edge and Y=height is the ridgeward (covered) edge.
+            # Place at the eaveward edge of each shingle.
+
             # Create shingle geometry based on row
             if row == 0:
-                # Row 0: Rectangular box with exposed height only
+                # Row 0: Rectangular box (starter course, exposure height only)
                 shingle_shape = Part.makeBox(shingle_width, exposure, shingle_thickness)
-                shingle_shape.Placement = App.Placement(top_position, final_rotation)
+                butt_position = top_position + scale_vector(v_vec, -exposure)
+                shingle_shape.Placement = App.Placement(butt_position, final_rotation)
 
             else:
-                # Row 1+: Triangular wedge cross-section
-                # Top edge (Y=0, toward ridge): tapers to roof surface
-                # Bottom edge (Y=shingle_height, toward eave): thick (wedge_thickness)
-                # Height: full shingle_height
+                # Row 1+: Tapered (trapezoidal) cross-section
+                # In the right-handed local coords (Y = upslope):
+                #   Y=0 = butt edge (eave, visible, thick)
+                #   Y=shingle_height = covered edge (ridge, hidden, thin)
+                #   Z=0 = flat face on roof surface
+                #   Z>0 = exterior (tapered, visible)
+                top_thick = wedge_thickness * 0.2
 
-                p1 = App.Vector(0, 0, 0)                              # Top point (tapers to roof, toward ridge)
-                p2 = App.Vector(0, shingle_height, 0)                 # Bottom back (against roof, toward eave)
-                p3 = App.Vector(0, shingle_height, wedge_thickness)   # Bottom front (visible surface, toward eave)
+                p0 = App.Vector(0, 0, 0)                              # Butt end, on roof
+                p1 = App.Vector(0, 0, wedge_thickness)                # Butt end, exterior (thick)
+                p2 = App.Vector(0, shingle_height, top_thick)         # Covered end, exterior (thin)
+                p3 = App.Vector(0, shingle_height, 0)                 # Covered end, on roof
 
                 # Create edges connecting the points
+                l0 = Part.LineSegment(p0, p1)
                 l1 = Part.LineSegment(p1, p2)
                 l2 = Part.LineSegment(p2, p3)
-                l3 = Part.LineSegment(p3, p1)
+                l3 = Part.LineSegment(p3, p0)
 
                 # Make wire from edges
-                profile_wire = Part.Wire([l1.toShape(), l2.toShape(), l3.toShape()])
+                profile_wire = Part.Wire([l0.toShape(), l1.toShape(), l2.toShape(), l3.toShape()])
 
                 # Create face from wire
                 profile_face = Part.Face(profile_wire)
@@ -611,7 +646,8 @@ def generate_shingles(face, base_object, params):
                 extrude_vector = App.Vector(shingle_width, 0, 0)
                 shingle_shape = profile_face.extrude(extrude_vector)
 
-                shingle_shape.Placement = App.Placement(top_position, final_rotation)
+                butt_position = top_position + scale_vector(v_vec, -shingle_height)
+                shingle_shape.Placement = App.Placement(butt_position, final_rotation)
             
             # Clip shingle to face boundary if clipping volume exists
             if clip_volume is not None:
