@@ -1,11 +1,16 @@
 """
-Roof Seam Generator for FreeCAD v1.3.0
+Roof Seam Generator for FreeCAD v1.3.1
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.3.1: Fix fuse-invalid after clipping. The clip solid was extruded by
+         exactly mat_thick, making its top/bottom faces coplanar with the cap
+         → degenerate edges from common() → "Resulting shape is invalid" on
+         fuse. Now extrudes 3× mat_thick so the clip fully envelops the cap
+         in the normal direction; clipping only acts in the face plane.
 - 1.3.0: Clip hip cap halves to roof face boundaries. Each roof face is
          extruded by materialThickness along its normal to create a clipping
          solid; boolean intersection trims half-caps that overhang the eave
@@ -71,7 +76,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -379,11 +384,18 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     App.Console.PrintMessage("  Face 2 half:\n")
     rot2, outward2, _ = half_cap_setup(n2, face2.CenterOfMass)
 
-    # Clipping solids: extrude each roof face by mat_thick along its outward
-    # normal.  Boolean-intersecting each half-cap with the clip solid trims
-    # caps that overhang the eave at the bottom of a hip seam.
-    clip1 = face1.extrude(n1 * mat_thick)
-    clip2 = face2.extrude(n2 * mat_thick)
+    # Clipping solids: extrude each roof face along its outward normal.
+    # Boolean-intersecting each half-cap with the clip solid trims caps that
+    # overhang the eave at the bottom of a hip seam.
+    #
+    # Extrude by 3× mat_thick (not 1×) so the clip solid fully envelops the
+    # cap in the normal direction.  When the extrusion matches mat_thick
+    # exactly, top/bottom faces are coplanar with the cap → OCCT produces
+    # degenerate edges that cause downstream fuse operations to fail with
+    # "Resulting shape is invalid".
+    clip_thick = mat_thick * 3.0
+    clip1 = face1.extrude(n1 * clip_thick)
+    clip2 = face2.extrude(n2 * clip_thick)
 
     shapes = []
     clipped_count = 0
