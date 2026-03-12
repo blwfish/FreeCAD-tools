@@ -6,6 +6,12 @@ Author: Brian (with Claude assistance)
 Usage: Select one or more roof faces, run as macro in FreeCAD
 
 Version History:
+- 5.0.2: BUG FIX: Pick eave corner with minimum U-projection as origin so the face
+         extends in the positive U direction. Previously picked first eave corner
+         arbitrarily, which placed all shingles off the face when it was the right corner.
+- 5.0.1: BUG FIX: Use * operator instead of Vector.multiply() for clip volume extrusion.
+         App.Vector.multiply() mutates in place, so the second extrude got a vector
+         100× too large, destroying the clip volume and leaving only 1 shingle.
 - 5.0.0: MAJOR: Bounding-box based orientation detection replaces normal-based approach.
          Uses vertex Z coordinates to find eave (lowest) and ridge (highest), then
          calculates V-direction as eave→ridge. This is geometrically unambiguous and
@@ -102,7 +108,7 @@ except ImportError as e:
     print("Make sure shingle_geometry.py is in the _lib subdirectory of your Macro folder")
     sys.exit(1)
 
-VERSION = "5.0.0"
+VERSION = "5.0.2"
 GENERATOR_NAME = "shingle_generator"
 
 
@@ -249,8 +255,9 @@ def get_face_coordinate_system(face):
     ]
 
     if corner_vertices_at_eave:
-        # Use the corner vertex at eave level
-        origin = corner_vertices_at_eave[0].Point
+        # Pick the corner with minimum projection along u_vec so that the face
+        # extends in the positive U direction from the origin (not behind it).
+        origin = min(corner_vertices_at_eave, key=lambda v: v.Point.dot(u_vec)).Point
     # else: keep the origin from coord_sys
 
     # Calculate face extents by projecting all vertices onto U and V directions
@@ -535,8 +542,8 @@ def generate_shingles(face, base_object, params):
     try:
         # Extrude face inward and outward to create clipping volume
         extrusion_depth = 100.0  # Large enough to capture all shingles
-        clip_volume_pos = face.extrude(normal.multiply(extrusion_depth))
-        clip_volume_neg = face.extrude(normal.multiply(-extrusion_depth))
+        clip_volume_pos = face.extrude(normal * extrusion_depth)
+        clip_volume_neg = face.extrude(normal * (-extrusion_depth))
         clip_volume = clip_volume_pos.fuse(clip_volume_neg)
         
         print(f"✓ Face-based clipping volume created\n")
@@ -711,21 +718,24 @@ if __name__ == "__main__":
         
         if params_sheet:
             try:
-                params = get_params_from_spreadsheet(doc)
-                if params:
-                    print("Loaded parameters from spreadsheet:")
+                defaults = {
+                    'shingleWidth': 3.5,
+                    'shingleHeight': 2.0,
+                    'materialThickness': 0.25,
+                    'shingleExposure': 1.5,
+                    'shingleStaggerPattern': 'half'
+                }
+                sheet_params = get_params_from_spreadsheet(doc)
+                if sheet_params:
+                    params = {**defaults, **sheet_params}
+                    print("Loaded parameters from spreadsheet (missing keys use defaults):")
                     for key, val in params.items():
-                        print(f"  {key}: {val}")
+                        src = "(spreadsheet)" if key in sheet_params else "(default)"
+                        print(f"  {key}: {val} {src}")
                     print()
                 else:
                     print("Warning: Could not load parameters from spreadsheet, using defaults\n")
-                    params = {
-                        'shingleWidth': 3.5,
-                        'shingleHeight': 2.0,
-                        'materialThickness': 0.25,
-                        'shingleExposure': 1.5,
-                        'shingleStaggerPattern': 'half'
-                    }
+                    params = defaults
             except Exception as e:
                 print(f"Warning: {e}")
                 print("Using default parameters\n")
