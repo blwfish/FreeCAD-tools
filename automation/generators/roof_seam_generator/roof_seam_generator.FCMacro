@@ -1,11 +1,16 @@
 """
-Roof Seam Generator for FreeCAD v1.2.0
+Roof Seam Generator for FreeCAD v1.2.1
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.2.1: Fix rotation handedness bug in hip cap halves. When d is sign-flipped
+         to point toward the face interior, {d, edge_dir, n} becomes left-handed,
+         producing a reflection that flips one half 180°. Now computes Z axis as
+         d.cross(edge_dir) (always right-handed) and offsets the corner by
+         mat_thick along n when Z points inward.
 - 1.2.0: Redesign hip cap geometry. Each cap position now produces two
          half-shingles, one per face, each lying flat on its slope and
          meeting at the shared edge. The previous single flat box floated
@@ -62,7 +67,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -295,15 +300,15 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     flat slab" problem that occurs when a single rectangular box is placed in
     the bisector plane of a steep diagonal hip seam.
 
-    Layout per cap position:
-      - Half 1 (face1 side): corner at seam point, extends cap_width/2 along
-        face1 away from seam, cap_height along edge, mat_thick along n1.
-      - Half 2 (face2 side): same corner, extends cap_width/2 along face2,
-        cap_height along edge, mat_thick along n2.
+    Coordinate system per half (guaranteed right-handed):
+      X = d  — away from seam toward face interior (sign-corrected)
+      Y = edge_dir — along the shared edge
+      Z = d × edge_dir — perpendicular to X and Y
 
-    The "away from seam" directions d1 and d2 are computed as
-    normalize(face_normal × edge_dir), with sign chosen so they point toward
-    each face's interior (away from the shared edge).
+    When d is sign-flipped (to point toward the face interior), Z may end up
+    pointing inward (−n) instead of outward (+n).  In that case the box
+    corner is offset outward by materialThickness so the box still sits on
+    top of the face surface.
     """
     cap_width    = params.get('hipCapWidth', params.get('shingleWidth', 3.5))
     cap_height   = params.get('shingleHeight', 2.0)
@@ -327,44 +332,63 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     n1 = face_normal_at_center(face1)
     n2 = face_normal_at_center(face2)
 
-    # Directions perpendicular to the edge that lie in each face's plane,
-    # pointing away from the seam toward each face's interior.
     seam_mid = (start_pt + end_pt) * 0.5
 
-    def face_away_dir(n, face_centroid):
-        raw = n.cross(edge_dir)
-        d   = raw * (1.0 / raw.Length)
+    def half_cap_setup(n, face_centroid):
+        """
+        Compute rotation and corner offset for one half-cap.
+
+        Returns (rotation, z_outward) where z_outward is True if the box
+        sits naturally on the surface (corner at seam point) or False if
+        the corner must be offset by mat_thick along n.
+        """
+        # d: perpendicular to edge, in face plane
+        d_raw = n.cross(edge_dir)
+        d     = d_raw * (1.0 / d_raw.Length)
+
+        # Sign-correct d to point toward face interior
         if (face_centroid - seam_mid).dot(d) < 0:
             d = d * -1.0
-        return d
 
-    d1 = face_away_dir(n1, face1.CenterOfMass)
-    d2 = face_away_dir(n2, face2.CenterOfMass)
+        # Z = d × edge_dir — guaranteed right-handed with X=d, Y=edge_dir
+        z = d.cross(edge_dir)
+        z = z * (1.0 / z.Length)
+
+        outward = z.dot(n) >= 0
+
+        App.Console.PrintMessage(
+            f"    d=({d.x:.3f},{d.y:.3f},{d.z:.3f})  "
+            f"z=({z.x:.3f},{z.y:.3f},{z.z:.3f})  outward={outward}\n"
+        )
+
+        rot = App.Rotation(make_rotation_matrix(d, edge_dir, z))
+        return rot, outward, n
 
     App.Console.PrintMessage(
         f"  edge_dir: ({edge_dir.x:.3f}, {edge_dir.y:.3f}, {edge_dir.z:.3f})\n"
         f"  n1:       ({n1.x:.3f}, {n1.y:.3f}, {n1.z:.3f})\n"
         f"  n2:       ({n2.x:.3f}, {n2.y:.3f}, {n2.z:.3f})\n"
-        f"  d1:       ({d1.x:.3f}, {d1.y:.3f}, {d1.z:.3f})\n"
-        f"  d2:       ({d2.x:.3f}, {d2.y:.3f}, {d2.z:.3f})\n"
     )
 
-    # One rotation per face half: X=away from seam, Y=along edge, Z=face normal
-    rot1 = App.Rotation(make_rotation_matrix(d1, edge_dir, n1))
-    rot2 = App.Rotation(make_rotation_matrix(d2, edge_dir, n2))
+    App.Console.PrintMessage("  Face 1 half:\n")
+    rot1, outward1, _ = half_cap_setup(n1, face1.CenterOfMass)
+    App.Console.PrintMessage("  Face 2 half:\n")
+    rot2, outward2, _ = half_cap_setup(n2, face2.CenterOfMass)
 
     shapes = []
     t = 0.0
     while t < edge_len:
         pt = start_pt + edge_dir * t
 
-        # Half on face1: corner at seam, extends toward face1 interior
+        # Face1 half
         h1 = Part.makeBox(half_width, cap_height, mat_thick)
-        h1.Placement = App.Placement(pt, rot1)
+        corner1 = pt if outward1 else pt + n1 * mat_thick
+        h1.Placement = App.Placement(corner1, rot1)
 
-        # Half on face2: corner at seam, extends toward face2 interior
+        # Face2 half
         h2 = Part.makeBox(half_width, cap_height, mat_thick)
-        h2.Placement = App.Placement(pt, rot2)
+        corner2 = pt if outward2 else pt + n2 * mat_thick
+        h2.Placement = App.Placement(corner2, rot2)
 
         shapes.extend([h1, h2])
         t += exposure
