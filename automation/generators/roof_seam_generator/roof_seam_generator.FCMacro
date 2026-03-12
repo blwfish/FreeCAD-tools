@@ -1,11 +1,15 @@
 """
-Roof Seam Generator for FreeCAD v1.1.2
+Roof Seam Generator for FreeCAD v1.2.0
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.2.0: Redesign hip cap geometry. Each cap position now produces two
+         half-shingles, one per face, each lying flat on its slope and
+         meeting at the shared edge. The previous single flat box floated
+         above the roof surface on any seam with a significant slope angle.
 - 1.1.2: Fix face-matching metric in closest_base_face(). Centroid-to-centroid
          distance was picking eave/soffit faces instead of slope faces for
          shingles near the hip seam. Now uses distToShape() (point-to-surface
@@ -58,7 +62,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -286,15 +290,26 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     """
     Generate cap shingles straddling the hip/ridge edge.
 
-    Each cap is a thin rectangular slab:
-      - Centered on the edge (width spans both roof faces)
-      - Placed at shingleExposure intervals along the edge
-      - Thickness extends outward along the bisector of the two face normals
+    Each cap position produces TWO half-shingles that each lie flat on their
+    respective face and meet at the shared edge.  This avoids the "floating
+    flat slab" problem that occurs when a single rectangular box is placed in
+    the bisector plane of a steep diagonal hip seam.
+
+    Layout per cap position:
+      - Half 1 (face1 side): corner at seam point, extends cap_width/2 along
+        face1 away from seam, cap_height along edge, mat_thick along n1.
+      - Half 2 (face2 side): same corner, extends cap_width/2 along face2,
+        cap_height along edge, mat_thick along n2.
+
+    The "away from seam" directions d1 and d2 are computed as
+    normalize(face_normal × edge_dir), with sign chosen so they point toward
+    each face's interior (away from the shared edge).
     """
     cap_width    = params.get('hipCapWidth', params.get('shingleWidth', 3.5))
     cap_height   = params.get('shingleHeight', 2.0)
     mat_thick    = params.get('materialThickness', 0.25)
     exposure     = params.get('shingleExposure', 1.5)
+    half_width   = cap_width / 2.0
 
     App.Console.PrintMessage(
         f"Hip cap: width={cap_width:.2f}  height={cap_height:.2f}  "
@@ -306,40 +321,55 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     end_pt     = shared_edge.Vertexes[-1].Point
     edge_vec   = end_pt - start_pt
     edge_len   = edge_vec.Length
-    edge_dir   = edge_vec * (1.0 / edge_len)          # unit vector along edge
+    edge_dir   = edge_vec * (1.0 / edge_len)
 
-    # Face normals → bisector (outward from hip peak)
+    # Face normals (outward from roof surface)
     n1 = face_normal_at_center(face1)
     n2 = face_normal_at_center(face2)
-    bisector_raw = n1 + n2
-    bisector     = bisector_raw * (1.0 / bisector_raw.Length)
 
-    # Width direction: perpendicular to edge AND bisector, spanning across the hip
-    wd_raw    = edge_dir.cross(bisector)
-    width_dir = wd_raw * (1.0 / wd_raw.Length)
+    # Directions perpendicular to the edge that lie in each face's plane,
+    # pointing away from the seam toward each face's interior.
+    seam_mid = (start_pt + end_pt) * 0.5
+
+    def face_away_dir(n, face_centroid):
+        raw = n.cross(edge_dir)
+        d   = raw * (1.0 / raw.Length)
+        if (face_centroid - seam_mid).dot(d) < 0:
+            d = d * -1.0
+        return d
+
+    d1 = face_away_dir(n1, face1.CenterOfMass)
+    d2 = face_away_dir(n2, face2.CenterOfMass)
 
     App.Console.PrintMessage(
-        f"  edge_dir:  ({edge_dir.x:.3f}, {edge_dir.y:.3f}, {edge_dir.z:.3f})\n"
-        f"  bisector:  ({bisector.x:.3f}, {bisector.y:.3f}, {bisector.z:.3f})\n"
-        f"  width_dir: ({width_dir.x:.3f}, {width_dir.y:.3f}, {width_dir.z:.3f})\n"
+        f"  edge_dir: ({edge_dir.x:.3f}, {edge_dir.y:.3f}, {edge_dir.z:.3f})\n"
+        f"  n1:       ({n1.x:.3f}, {n1.y:.3f}, {n1.z:.3f})\n"
+        f"  n2:       ({n2.x:.3f}, {n2.y:.3f}, {n2.z:.3f})\n"
+        f"  d1:       ({d1.x:.3f}, {d1.y:.3f}, {d1.z:.3f})\n"
+        f"  d2:       ({d2.x:.3f}, {d2.y:.3f}, {d2.z:.3f})\n"
     )
 
-    # Rotation: box X → width_dir, box Y → edge_dir, box Z → bisector
-    rotation = App.Rotation(make_rotation_matrix(width_dir, edge_dir, bisector))
+    # One rotation per face half: X=away from seam, Y=along edge, Z=face normal
+    rot1 = App.Rotation(make_rotation_matrix(d1, edge_dir, n1))
+    rot2 = App.Rotation(make_rotation_matrix(d2, edge_dir, n2))
 
     shapes = []
     t = 0.0
     while t < edge_len:
-        point_on_edge = start_pt + edge_dir * t
-        # Corner: back at center of edge in width direction, leading edge at t
-        corner = point_on_edge - width_dir * (cap_width / 2.0)
+        pt = start_pt + edge_dir * t
 
-        cap = Part.makeBox(cap_width, cap_height, mat_thick)
-        cap.Placement = App.Placement(corner, rotation)
-        shapes.append(cap)
+        # Half on face1: corner at seam, extends toward face1 interior
+        h1 = Part.makeBox(half_width, cap_height, mat_thick)
+        h1.Placement = App.Placement(pt, rot1)
+
+        # Half on face2: corner at seam, extends toward face2 interior
+        h2 = Part.makeBox(half_width, cap_height, mat_thick)
+        h2.Placement = App.Placement(pt, rot2)
+
+        shapes.extend([h1, h2])
         t += exposure
 
-    App.Console.PrintMessage(f"  Generated {len(shapes)} hip cap shingles\n")
+    App.Console.PrintMessage(f"  Generated {len(shapes)//2} hip cap pairs ({len(shapes)} pieces)\n")
     return shapes
 
 
