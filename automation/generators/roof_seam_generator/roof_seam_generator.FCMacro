@@ -1,11 +1,16 @@
 """
-Roof Seam Generator for FreeCAD v1.4.1
+Roof Seam Generator for FreeCAD v1.5.0
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.5.0: Replace cumulative stagger with tapered cap profile. Each cap is
+         a wedge: full mat_thick at the exposed butt edge, tapering to 20%
+         at the covered top edge. The taper creates a visible shadow-line
+         at each butt edge in STL without cumulative lift-off. Removed
+         bisector stagger entirely.
 - 1.4.1: Fix wishbone splitting at apex. Stagger was offset along each
          face's individual normal, so the two halves diverged as the
          cumulative offset grew. Now offsets along the bisector of the
@@ -88,7 +93,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -308,6 +313,43 @@ def make_rotation_matrix(x_axis, y_axis, z_axis):
     )
 
 
+def make_tapered_box(width, height, butt_thick, top_thick):
+    """
+    Create a box tapered in Z along the Y axis.
+
+    At Y=0 (the exposed butt edge) the box is butt_thick tall.
+    At Y=height (the covered top edge) it is top_thick tall.
+    Bottom face lies in the Z=0 plane.
+
+    This taper creates the visible shadow-line at each butt edge
+    that makes individual shingles/caps distinguishable in STL export,
+    without needing cumulative stagger.
+    """
+    p0 = Vector(0, 0, 0)
+    p1 = Vector(width, 0, 0)
+    p2 = Vector(width, height, 0)
+    p3 = Vector(0, height, 0)
+    p4 = Vector(0, 0, butt_thick)
+    p5 = Vector(width, 0, butt_thick)
+    p6 = Vector(width, height, top_thick)
+    p7 = Vector(0, height, top_thick)
+
+    def _face(pts):
+        edges = [Part.makeLine(pts[i], pts[(i + 1) % len(pts)])
+                 for i in range(len(pts))]
+        return Part.Face(Part.Wire(edges))
+
+    shell = Part.makeShell([
+        _face([p0, p1, p2, p3]),  # bottom
+        _face([p7, p6, p5, p4]),  # top (reversed for outward normal)
+        _face([p0, p1, p5, p4]),  # front — butt edge
+        _face([p3, p7, p6, p2]),  # back  — covered edge
+        _face([p0, p4, p7, p3]),  # left
+        _face([p1, p2, p6, p5]),  # right
+    ])
+    return Part.makeSolid(shell)
+
+
 # ============================================================================
 # Cap shingle generation (hip / ridge)
 # ============================================================================
@@ -404,42 +446,35 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     App.Console.PrintMessage("  Face 2 half:\n")
     rot2, outward2, _ = half_cap_setup(n2, face2.CenterOfMass)
 
-    # Bisector of the two face normals — points straight out from the ridge.
-    # Used for stagger offset so both halves lift together (no wishbone).
-    bisector = n1 + n2
-    bisector = bisector * (1.0 / bisector.Length)
-
     # Clipping solids: extrude each roof face along its outward normal.
     # Boolean-intersecting each half-cap with the clip solid trims caps that
     # overhang the eave at the bottom of a hip seam.
     #
-    # The extrusion must be thick enough to encompass the full stagger stack
-    # (num_caps × mat_thick) plus margin to avoid coplanar faces with the
-    # topmost cap (which causes OCCT boolean degenerate edges).
-    num_caps = max(1, int(edge_len / exposure))
-    clip_thick = (num_caps + 2) * mat_thick
+    # Extrude by 3× mat_thick (not 1×) so the clip solid fully envelops
+    # the cap in the normal direction, avoiding coplanar faces that cause
+    # OCCT boolean degenerate edges.
+    clip_thick = mat_thick * 3.0
     clip1 = face1.extrude(n1 * clip_thick)
     clip2 = face2.extrude(n2 * clip_thick)
 
+    # Tapered profile: butt edge (exposed, Y=0) is full mat_thick;
+    # covered edge (Y=cap_height) tapers to ~20%.  The taper creates
+    # a visible shadow-line at each butt edge without cumulative stagger.
+    butt_thick = mat_thick
+    top_thick  = mat_thick * 0.2
+
     shapes = []
     clipped_count = 0
-    cap_idx = 0
     t = 0.0
     while t < edge_len:
         pt = start_pt + edge_dir * t
-        # Stagger: each cap pair sits mat_thick above the previous pair,
-        # offset along the bisector so both halves rise together.
-        stagger_vec = bisector * (cap_idx * mat_thick)
 
         for clip, rot, outward, n in [
             (clip1, rot1, outward1, n1),
             (clip2, rot2, outward2, n2),
         ]:
-            h = Part.makeBox(half_width, cap_height, mat_thick)
-            if outward:
-                corner = pt + stagger_vec
-            else:
-                corner = pt + n * mat_thick + stagger_vec
+            h = make_tapered_box(half_width, cap_height, butt_thick, top_thick)
+            corner = pt if outward else pt + n * butt_thick
             h.Placement = App.Placement(corner, rot)
 
             trimmed = h.common(clip)
@@ -450,7 +485,6 @@ def generate_hip_caps(shared_edge, face1, face2, params):
             else:
                 clipped_count += 1
 
-        cap_idx += 1
         t += exposure
 
     if clipped_count:
