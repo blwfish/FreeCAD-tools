@@ -1,11 +1,19 @@
 """
-Roof Seam Generator for FreeCAD v1.3.1
+Roof Seam Generator for FreeCAD v1.4.0
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.4.0: Stagger hip caps and close ridge channel.
+         1) Each half extends mat_thick past the ridge so the two halves
+            overlap at the seam, closing the V-groove between slopes.
+         2) Edge iteration runs eave→apex (low Z to high Z). Each
+            successive cap is offset by mat_thick along the face normal,
+            creating the visible overlap/stagger that makes individual
+            cap shingles distinguishable in STL export.
+         Clip solid extrusion scaled to encompass the full stagger stack.
 - 1.3.1: Fix fuse-invalid after clipping. The clip solid was extruded by
          exactly mat_thick, making its top/bottom faces coplanar with the cap
          → degenerate edges from common() → "Resulting shape is invalid" on
@@ -76,7 +84,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -323,16 +331,24 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     cap_height   = params.get('shingleHeight', 2.0)
     mat_thick    = params.get('materialThickness', 0.25)
     exposure     = params.get('shingleExposure', 1.5)
-    half_width   = cap_width / 2.0
+    # Extend each half past the ridge by mat_thick so the two halves
+    # overlap at the seam, closing the V-channel between slopes.
+    half_width   = cap_width / 2.0 + mat_thick
 
     App.Console.PrintMessage(
         f"Hip cap: width={cap_width:.2f}  height={cap_height:.2f}  "
         f"thickness={mat_thick:.2f}  exposure={exposure:.2f}\n"
     )
 
-    # Edge geometry
-    start_pt   = shared_edge.Vertexes[0].Point
-    end_pt     = shared_edge.Vertexes[-1].Point
+    # Edge geometry — orient so we iterate from eave (low Z) to apex (high Z).
+    # Hip caps are installed bottom-up: each successive cap sits mat_thick
+    # higher than the previous, creating the visible overlap/stagger.
+    v0 = shared_edge.Vertexes[0].Point
+    v1 = shared_edge.Vertexes[-1].Point
+    if v0.z <= v1.z:
+        start_pt, end_pt = v0, v1      # eave → apex
+    else:
+        start_pt, end_pt = v1, v0      # flip so eave is first
     edge_vec   = end_pt - start_pt
     edge_len   = edge_vec.Length
     edge_dir   = edge_vec * (1.0 / edge_len)
@@ -388,38 +404,44 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     # Boolean-intersecting each half-cap with the clip solid trims caps that
     # overhang the eave at the bottom of a hip seam.
     #
-    # Extrude by 3× mat_thick (not 1×) so the clip solid fully envelops the
-    # cap in the normal direction.  When the extrusion matches mat_thick
-    # exactly, top/bottom faces are coplanar with the cap → OCCT produces
-    # degenerate edges that cause downstream fuse operations to fail with
-    # "Resulting shape is invalid".
-    clip_thick = mat_thick * 3.0
+    # The extrusion must be thick enough to encompass the full stagger stack
+    # (num_caps × mat_thick) plus margin to avoid coplanar faces with the
+    # topmost cap (which causes OCCT boolean degenerate edges).
+    num_caps = max(1, int(edge_len / exposure))
+    clip_thick = (num_caps + 2) * mat_thick
     clip1 = face1.extrude(n1 * clip_thick)
     clip2 = face2.extrude(n2 * clip_thick)
 
     shapes = []
     clipped_count = 0
+    cap_idx = 0
     t = 0.0
     while t < edge_len:
         pt = start_pt + edge_dir * t
+        # Stagger: each cap sits mat_thick above the previous one.
+        # cap_idx=0 is at eave (base level), highest index is at apex (top).
+        stagger = cap_idx * mat_thick
 
         for clip, rot, outward, n in [
             (clip1, rot1, outward1, n1),
             (clip2, rot2, outward2, n2),
         ]:
             h = Part.makeBox(half_width, cap_height, mat_thick)
-            corner = pt if outward else pt + n * mat_thick
+            if outward:
+                corner = pt + n * stagger
+            else:
+                corner = pt + n * (mat_thick + stagger)
             h.Placement = App.Placement(corner, rot)
 
             trimmed = h.common(clip)
             if trimmed.Solids:
                 shapes.append(trimmed)
             elif trimmed.Volume > 1e-6:
-                # Non-solid but has volume (e.g. shell) — keep the shape
                 shapes.append(trimmed)
             else:
                 clipped_count += 1
 
+        cap_idx += 1
         t += exposure
 
     if clipped_count:
