@@ -1,11 +1,15 @@
 """
-Roof Seam Generator for FreeCAD v1.0.0
+Roof Seam Generator for FreeCAD v1.0.1
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.0.1: Replace sys.exit() with if/else (FreeCAD macro best practice).
+         Add raw selection dump to the "wrong face count" error so the cause
+         (e.g. selection cleared by Macros dialog, or whole-object selected
+         instead of face sub-elements) is immediately visible in the log.
 - 1.0.0: Initial release.
          Auto-detects hip vs valley from Z coordinates:
            Hip/ridge: non-shared vertices are BELOW the shared edge
@@ -36,7 +40,7 @@ from FreeCAD import Vector
 import math
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -300,109 +304,120 @@ if __name__ == "__main__":
     doc = App.ActiveDocument
     if not doc:
         App.Console.PrintError("ERROR: No active document\n")
-        sys.exit(1)
-
-    App.Console.PrintMessage(f"\n{'='*60}\n")
-    App.Console.PrintMessage(f"Roof Seam Generator v{VERSION}\n")
-    App.Console.PrintMessage(f"{'='*60}\n\n")
-
-    # --- Load parameters ---
-    defaults = {
-        'shingleWidth':       3.5,
-        'shingleHeight':      2.0,
-        'materialThickness':  0.25,
-        'shingleExposure':    1.5,
-        # hipCapWidth:        defaults to shingleWidth inside generate_hip_caps
-        # valleyFlashingWidth: defaults to materialThickness * 8 inside generate_valley_flashing
-    }
-    sheet_params = get_params_from_spreadsheet(doc)
-    params = {**defaults, **sheet_params}
-
-    App.Console.PrintMessage("Parameters:\n")
-    for k, v in sorted(params.items()):
-        src = "(spreadsheet)" if k in sheet_params else "(default)"
-        App.Console.PrintMessage(f"  {k}: {v} {src}\n")
-    App.Console.PrintMessage("\n")
-
-    # --- Validate exposure vs height ---
-    if params.get('shingleExposure', 0) > params.get('shingleHeight', float('inf')):
-        App.Console.PrintError(
-            f"ERROR: shingleExposure ({params['shingleExposure']}) "
-            f"cannot exceed shingleHeight ({params['shingleHeight']})\n\n"
-        )
-        sys.exit(1)
-
-    # --- Get selected faces ---
-    selection = Gui.Selection.getSelectionEx()
-    selected_faces = []
-    for sel in selection:
-        if not sel.HasSubObjects:
-            continue
-        for sub in sel.SubElementNames:
-            if sub.startswith("Face"):
-                idx  = int(sub[4:]) - 1
-                face = sel.Object.Shape.Faces[idx]
-                selected_faces.append((face, sel.Object))
-
-    if len(selected_faces) != 2:
-        App.Console.PrintError(
-            f"ERROR: Select exactly 2 adjacent roof faces (got {len(selected_faces)})\n\n"
-        )
-        App.Console.PrintMessage("Usage:\n")
-        App.Console.PrintMessage("  1. Ctrl+click two adjacent roof faces\n")
-        App.Console.PrintMessage("  2. Run this macro\n\n")
-        sys.exit(1)
-
-    face1, obj1 = selected_faces[0]
-    face2, obj2 = selected_faces[1]
-
-    # --- Find shared edge ---
-    App.Console.PrintMessage("Finding shared edge...\n")
-    shared_edge = find_shared_edge(face1, face2)
-
-    if shared_edge is None:
-        App.Console.PrintError(
-            "ERROR: No shared edge found between the two selected faces.\n"
-            "Make sure you select two adjacent faces that share an edge.\n\n"
-        )
-        sys.exit(1)
-
-    App.Console.PrintMessage(f"  Found shared edge, length = {shared_edge.Length:.2f} mm\n")
-
-    # --- Classify seam type ---
-    seam_type = classify_seam(face1, face2, shared_edge)
-    App.Console.PrintMessage(f"  Seam type: {seam_type.upper()}\n\n")
-
-    # --- Generate geometry ---
-    base_name = obj1.Name
-
-    if seam_type == 'hip':
-        shapes = generate_hip_caps(shared_edge, face1, face2, params)
-        output_name = f"HipCap_{base_name}"
     else:
-        shapes = generate_valley_flashing(shared_edge, face1, face2, params)
-        output_name = f"ValleyFlashing_{base_name}"
+        App.Console.PrintMessage(f"\n{'='*60}\n")
+        App.Console.PrintMessage(f"Roof Seam Generator v{VERSION}\n")
+        App.Console.PrintMessage(f"{'='*60}\n\n")
 
-    if not shapes:
-        App.Console.PrintError("ERROR: No geometry generated.\n")
-        sys.exit(1)
+        # --- Load parameters ---
+        defaults = {
+            'shingleWidth':       3.5,
+            'shingleHeight':      2.0,
+            'materialThickness':  0.25,
+            'shingleExposure':    1.5,
+            # hipCapWidth:        defaults to shingleWidth inside generate_hip_caps
+            # valleyFlashingWidth: defaults to materialThickness * 8 inside generate_valley_flashing
+        }
+        sheet_params = get_params_from_spreadsheet(doc)
+        params = {**defaults, **sheet_params}
 
-    # --- Create output Part::Feature ---
-    compound = Part.Compound(shapes)
-    result = doc.addObject("Part::Feature", output_name)
-    result.Shape = compound
+        App.Console.PrintMessage("Parameters:\n")
+        for k, v in sorted(params.items()):
+            src = "(spreadsheet)" if k in sheet_params else "(default)"
+            App.Console.PrintMessage(f"  {k}: {v} {src}\n")
+        App.Console.PrintMessage("\n")
 
-    result.addProperty("App::PropertyString", "GeneratorName",    "Metadata", "Generator name")
-    result.GeneratorName    = GENERATOR_NAME
+        # --- Validate exposure vs height ---
+        if params.get('shingleExposure', 0) > params.get('shingleHeight', float('inf')):
+            App.Console.PrintError(
+                f"ERROR: shingleExposure ({params['shingleExposure']}) "
+                f"cannot exceed shingleHeight ({params['shingleHeight']})\n\n"
+            )
 
-    result.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
-    result.GeneratorVersion = VERSION
+        else:
+            # --- Get selected faces ---
+            selection = Gui.Selection.getSelectionEx()
+            selected_faces = []
+            for sel in selection:
+                if not sel.HasSubObjects:
+                    continue
+                for sub in sel.SubElementNames:
+                    if sub.startswith("Face"):
+                        idx  = int(sub[4:]) - 1
+                        face = sel.Object.Shape.Faces[idx]
+                        selected_faces.append((face, sel.Object))
 
-    result.addProperty("App::PropertyString", "SeamType",         "Metadata", "Seam type (hip or valley)")
-    result.SeamType         = seam_type
+            if len(selected_faces) != 2:
+                App.Console.PrintError(
+                    f"ERROR: Select exactly 2 adjacent roof faces (got {len(selected_faces)})\n\n"
+                )
+                # Dump raw selection state to help diagnose the cause
+                App.Console.PrintMessage(f"Raw selection ({len(selection)} item(s)):\n")
+                if not selection:
+                    App.Console.PrintMessage(
+                        "  (empty — selection was cleared before macro ran;\n"
+                        "   run via toolbar button, not the Macros… dialog)\n"
+                    )
+                for sel in selection:
+                    App.Console.PrintMessage(
+                        f"  obj={sel.Object.Name}  HasSubObjects={sel.HasSubObjects}"
+                        f"  SubElementNames={sel.SubElementNames}\n"
+                    )
+                App.Console.PrintMessage("\nUsage:\n")
+                App.Console.PrintMessage("  1. Ctrl+click two adjacent roof faces in the 3D view\n")
+                App.Console.PrintMessage("  2. Run via toolbar button (not Macros… dialog)\n\n")
 
-    doc.recompute()
+            else:
+                face1, obj1 = selected_faces[0]
+                face2, obj2 = selected_faces[1]
 
-    App.Console.PrintMessage(f"\n{'='*60}\n")
-    App.Console.PrintMessage(f"SUCCESS: Created '{output_name}' ({len(shapes)} piece(s))\n")
-    App.Console.PrintMessage(f"{'='*60}\n\n")
+                # --- Find shared edge ---
+                App.Console.PrintMessage("Finding shared edge...\n")
+                shared_edge = find_shared_edge(face1, face2)
+
+                if shared_edge is None:
+                    App.Console.PrintError(
+                        "ERROR: No shared edge found between the two selected faces.\n"
+                        "Make sure you select two adjacent faces that share an edge.\n\n"
+                    )
+
+                else:
+                    App.Console.PrintMessage(f"  Found shared edge, length = {shared_edge.Length:.2f} mm\n")
+
+                    # --- Classify seam type ---
+                    seam_type = classify_seam(face1, face2, shared_edge)
+                    App.Console.PrintMessage(f"  Seam type: {seam_type.upper()}\n\n")
+
+                    # --- Generate geometry ---
+                    base_name = obj1.Name
+
+                    if seam_type == 'hip':
+                        shapes = generate_hip_caps(shared_edge, face1, face2, params)
+                        output_name = f"HipCap_{base_name}"
+                    else:
+                        shapes = generate_valley_flashing(shared_edge, face1, face2, params)
+                        output_name = f"ValleyFlashing_{base_name}"
+
+                    if not shapes:
+                        App.Console.PrintError("ERROR: No geometry generated.\n")
+
+                    else:
+                        # --- Create output Part::Feature ---
+                        compound = Part.Compound(shapes)
+                        result = doc.addObject("Part::Feature", output_name)
+                        result.Shape = compound
+
+                        result.addProperty("App::PropertyString", "GeneratorName",    "Metadata", "Generator name")
+                        result.GeneratorName    = GENERATOR_NAME
+
+                        result.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+                        result.GeneratorVersion = VERSION
+
+                        result.addProperty("App::PropertyString", "SeamType",         "Metadata", "Seam type (hip or valley)")
+                        result.SeamType         = seam_type
+
+                        doc.recompute()
+
+                        App.Console.PrintMessage(f"\n{'='*60}\n")
+                        App.Console.PrintMessage(f"SUCCESS: Created '{output_name}' ({len(shapes)} piece(s))\n")
+                        App.Console.PrintMessage(f"{'='*60}\n\n")
