@@ -270,7 +270,7 @@ class BrickGeometry:
                         brick_type='header',
                         width=self.header_width,
                         height=self.brick_height,
-                        depth=self.skin_depth
+                        depth=self.brick_width  # header lies perpendicular: full brick width
                     )
                     bricks.append(brick)
                     u += self.header_width + self.mortar
