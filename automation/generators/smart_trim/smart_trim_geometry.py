@@ -8,6 +8,7 @@ No dependencies on FreeCAD.Part, FreeCAD.Vector, etc.
 Uses standard Python types (tuples, dicts, lists) for I/O.
 
 Version History:
+- 1.0.2: Restored get_edge_midpoint utility
 - 1.0.1: Removed filter_edges_for_trim (replaced by is_perimeter_edge in macro)
          The bbox-based perimeter check is more robust than signature matching
 - 1.0.0: Initial release
@@ -155,6 +156,20 @@ def classify_edges(edges: List[Dict],
         results.append((i, classification))
     
     return results
+
+
+def get_edge_midpoint(edge: dict) -> tuple:
+    """
+    Calculate the midpoint of an edge.
+
+    Args:
+        edge: Dict with 'start' and 'end' tuples of (x, y, z)
+
+    Returns:
+        Midpoint as (x, y, z) tuple
+    """
+    s, e = edge['start'], edge['end']
+    return ((s[0] + e[0]) / 2, (s[1] + e[1]) / 2, (s[2] + e[2]) / 2)
 
 
 def get_edge_length(edge: Dict) -> float:
