@@ -1,5 +1,5 @@
 """
-Parametric Brick Generator Macro v5.1.0
+Parametric Brick Generator Macro v5.3.0
 
 Simplified UI layer that orchestrates brick generation using brick_geometry library.
 Handles FreeCAD coordinate systems and directly modifies the source wall body.
@@ -19,6 +19,17 @@ Benefits over the old outward-extrusion approach:
 Supports both vertical wall faces and horizontal surfaces (ledges, caps, sills).
 
 Version History:
+- 5.3.0 (2026-03-13): ADD: Transaction wrapping for all document mutations — all brick
+                           engraving operations are now a single Ctrl+Z undo step.
+                           Parametric conversion, face engraving, and sketch-based output
+                           each wrapped in openTransaction/commitTransaction/abortTransaction.
+- 5.2.0 (2026-03-13): FIX: U snap removed from snap_origin_to_global_grid — only V (course
+                           height) is snapped. U snapping shifted the origin outside the face
+                           boundary, making Flemish/English C0 closers entirely invisible on
+                           even courses and creating a staircase at wall edges.
+                      FIX: Bricks clipped to face_slab before mortar_grid computation — bricks
+                           straddling window/opening edges are now trimmed at the face boundary,
+                           eliminating alternating blank strips (staircase) at window edges.
 - 5.1.0 (2026-03-04): FIX: All output now goes to FreeCAD Report View (was print-only)
                       FIX: Improved face re-identification after recess boolean
                            Uses weighted scoring (normal + area + centroid) to prevent
@@ -57,8 +68,8 @@ Version History:
                       COMPATIBLE: Works with both continuous walls and segmented bays
 - 3.0.0 (2025-11-26): Initial release with bond patterns
 
-Version: 5.1.0
-Date: 2026-03-04
+Version: 5.3.0
+Date: 2026-03-13
 """
 
 import FreeCAD as App
@@ -66,6 +77,9 @@ import Part
 import math
 import sys
 import os
+
+VERSION = "5.3.0"
+GENERATOR_NAME = "brick_generator"
 
 
 def log(msg=""):
@@ -108,7 +122,7 @@ if 'freecad_utils' in sys.modules:
     del sys.modules['freecad_utils']
 try:
     import freecad_utils
-    from freecad_utils import get_global_face, log_global_placement
+    from freecad_utils import get_global_face, log_global_placement, commit_result
     log(f"Loaded freecad_utils v{getattr(freecad_utils, '__version__', 'unknown')}")
 except ImportError:
     # Fallback: define inline so macro still works if shared lib not installed yet
@@ -124,6 +138,29 @@ except ImportError:
         return face
     def log_global_placement(obj, label=None):
         pass
+    def commit_result(doc, object_name, shape, generator_name, generator_version,
+                      extra_props=None, transaction_label=None):
+        """Inline fallback: create output object without transaction wrapping."""
+        import Part
+        label = transaction_label or f"{generator_name}: {object_name}"
+        doc.openTransaction(label)
+        try:
+            result = doc.addObject("Part::Feature", object_name)
+            result.Shape = shape
+            result.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator name")
+            result.GeneratorName = generator_name
+            result.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+            result.GeneratorVersion = generator_version
+            if extra_props:
+                for prop_name, (prop_type, group, tooltip, value) in extra_props.items():
+                    result.addProperty(prop_type, prop_name, group, tooltip)
+                    setattr(result, prop_name, value)
+            doc.recompute()
+            doc.commitTransaction()
+        except Exception:
+            doc.abortTransaction()
+            raise
+        return result
 
 
 def recess_faces(sel_obj, sub_elements, skin_depth):
@@ -372,8 +409,12 @@ def snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, 
     origin_v = origin.dot(v_vec)  # Position along vertical wall direction
     origin_n = origin.dot(normal) # Position along normal (preserve this!)
 
-    # Snap only u and v to grid, keep normal component unchanged
-    snapped_u = round(origin_u / horizontal_grid) * horizontal_grid
+    # Snap only V (vertical) to grid — aligns horizontal mortar courses across faces.
+    # U (horizontal) is NOT snapped: bond types with closers (Flemish, English, Common)
+    # compute closers to exactly fill the face width, and snapping U would shift the
+    # origin outside the face boundary, making closers partly or fully invisible and
+    # creating a staircase pattern at wall edges.
+    snapped_u = origin_u  # No horizontal snap
     snapped_v = round(origin_v / vertical_grid) * vertical_grid
 
     # Reconstruct snapped origin
@@ -388,7 +429,7 @@ def snap_origin_to_global_grid(origin, u_vec, v_vec, brick_width, brick_height, 
 
     if adjustment_distance > 0.001:  # Only report if meaningful adjustment
         log(f"  Grid snapping: adjusted origin by {adjustment_distance:.3f}mm (in wall plane)")
-        log(f"    U (horizontal): {origin_u:.3f} → {snapped_u:.3f} mm")
+        log(f"    U (horizontal): {origin_u:.3f} → {snapped_u:.3f} mm (not snapped)")
         log(f"    V (vertical): {origin_v:.3f} → {snapped_v:.3f} mm")
         log(f"    Normal: {origin_n:.3f} mm (unchanged)")
 
@@ -883,23 +924,29 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                 if hasattr(sel_obj, 'Shape') and not sel_obj.Shape.isNull():
                     log(f"NOTE: {obj_name} is parametric ({sel_obj.TypeId})")
                     log(f"  Converting to Part::Feature so mortar engraving is preserved...")
-                    frozen = doc.addObject("Part::Feature", obj_name + "_Bricked")
-                    frozen.Shape = sel_obj.Shape.copy()
-                    # Transfer the visual appearance
-                    if hasattr(sel_obj, 'ViewObject') and hasattr(frozen, 'ViewObject'):
+                    doc.openTransaction(f"brick_generator: freeze {obj_name}")
+                    try:
+                        frozen = doc.addObject("Part::Feature", obj_name + "_Bricked")
+                        frozen.Shape = sel_obj.Shape.copy()
+                        # Transfer the visual appearance
+                        if hasattr(sel_obj, 'ViewObject') and hasattr(frozen, 'ViewObject'):
+                            try:
+                                frozen.ViewObject.ShapeColor = sel_obj.ViewObject.ShapeColor
+                            except Exception:
+                                pass
+                        # Hide the original
                         try:
-                            frozen.ViewObject.ShapeColor = sel_obj.ViewObject.ShapeColor
+                            sel_obj.ViewObject.Visibility = False
                         except Exception:
                             pass
-                    # Hide the original
-                    try:
-                        sel_obj.ViewObject.Visibility = False
+                        doc.recompute()
+                        doc.commitTransaction()
                     except Exception:
-                        pass
+                        doc.abortTransaction()
+                        raise
                     # Carry forward the original sub-element selection
                     sel_obj = frozen
                     obj_name = frozen.Label
-                    doc.recompute()
                     log(f"  ✓ Created {obj_name} (original hidden)")
 
             # Determine if this is a sketch or a face selection
@@ -1034,24 +1081,19 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                             log(f"Continuing with unpunched bricks")
                     log()
                     
-                    # Create result object
-                    result_obj = doc.addObject("Part::Feature", f"BrickedWall_{obj_name}")
-                    result_obj.Shape = result_shape
-                    
-                    # Add metadata
-                    result_obj.addProperty("App::PropertyString", "GeneratorName", "Metadata", "Generator that created this")
-                    result_obj.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
-                    result_obj.addProperty("App::PropertyString", "SourceObject", "Metadata", "Source object name")
-                    result_obj.addProperty("App::PropertyString", "BondType", "Metadata", "Bond pattern used")
-                    result_obj.addProperty("App::PropertyInteger", "BrickCount", "Metadata", "Number of bricks generated")
-                    
-                    result_obj.GeneratorName = "brick_generator"
-                    result_obj.GeneratorVersion = "5.0.0"
-                    result_obj.SourceObject = obj_name
-                    result_obj.BondType = bond_type
-                    result_obj.BrickCount = len(brick_defs)
-                    
-                    doc.recompute()
+                    # Create result object (undoable via transaction in commit_result)
+                    result_obj = commit_result(
+                        doc, f"BrickedWall_{obj_name}", result_shape,
+                        GENERATOR_NAME, VERSION,
+                        extra_props={
+                            "SourceObject": ("App::PropertyString", "Metadata",
+                                             "Source object name", obj_name),
+                            "BondType":     ("App::PropertyString", "Metadata",
+                                             "Bond pattern used", bond_type),
+                            "BrickCount":   ("App::PropertyInteger", "Metadata",
+                                             "Number of bricks generated", len(brick_defs)),
+                        },
+                    )
                     
                     log(f"\n✓ Created: {result_obj.Label}")
                     log(f"  Brick count: {len(brick_defs)}")
@@ -1175,8 +1217,21 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         # bricks proud (the original recessed surface).
                         slab_vec = scale_vector(normal, -mortar_depth)
                         face_slab = face.extrude(slab_vec)
-                        mortar_grid = face_slab.cut(brick_compound)
-                        log(f"  ✓ Mortar grid created (slab - {len(brick_defs)} bricks)")
+
+                        # Clip bricks to the face slab before subtracting.
+                        # Without clipping, bricks that straddle window/opening edges extend
+                        # into the opening area and block mortar cuts on the wall-side, creating
+                        # alternating blank strips (staircase) at each vertical window edge.
+                        # Intersecting with face_slab trims each brick to the actual face shape
+                        # (including window holes), so all courses have consistent boundaries.
+                        try:
+                            clipped_bricks = brick_compound.common(face_slab)
+                            mortar_grid = face_slab.cut(clipped_bricks)
+                            log(f"  ✓ Mortar grid created (slab - {len(brick_defs)} clipped bricks)")
+                        except Exception as clip_err:
+                            log(f"  WARNING: Brick clipping failed ({clip_err}), falling back to unclipped")
+                            mortar_grid = face_slab.cut(brick_compound)
+                            log(f"  ✓ Mortar grid created (slab - {len(brick_defs)} bricks, unclipped)")
 
                         # Add to collection
                         all_brick_shapes.append(mortar_grid)
@@ -1209,8 +1264,15 @@ if __name__ == '__main__' or __name__ == '__console__' or __name__ == '__plugins
                         if new_shape.isNull():
                             log("ERROR: Boolean cut returned null shape")
                         else:
-                            sel_obj.Shape = new_shape
-                            doc.recompute()
+                            tx_label = f"brick_generator: engrave {obj_name}"
+                            doc.openTransaction(tx_label)
+                            try:
+                                sel_obj.Shape = new_shape
+                                doc.recompute()
+                                doc.commitTransaction()
+                            except Exception:
+                                doc.abortTransaction()
+                                raise
 
                             log()
                             log(f"✓ Engraved mortar on: {obj_name}")

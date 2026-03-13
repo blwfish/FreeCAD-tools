@@ -4,12 +4,15 @@ freecad_utils.py — Shared FreeCAD utility library for generators
 Installed to: Macro/_lib/freecad_utils.py
 Imported by:  brick_generator_macro, radial_brick_generator_macro,
               clapboard_generator, board_batten_generator, bead_board_generator,
-              shingle_generator, smart_trim_generator, station_sign_generator
+              shingle_generator, smart_trim_generator, station_sign_generator,
+              roof_seam_generator
 
-Version: 1.0.2
+Version: 1.1.0
+  1.1.0: Add commit_result() — undoable output object creation with metadata.
+  1.0.2: Initial shared library (global placement helpers).
 """
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -118,3 +121,73 @@ def log_global_placement(obj, label=None):
                   f"will be applied to face geometry")
     except AttributeError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Undoable output creation
+# ---------------------------------------------------------------------------
+
+def commit_result(doc, object_name, shape, generator_name, generator_version,
+                  extra_props=None, transaction_label=None):
+    """
+    Create an output Part::Feature inside an undo transaction.
+
+    Wraps ``doc.addObject`` + property assignment + ``doc.recompute()``
+    in ``openTransaction`` / ``commitTransaction`` so the entire operation
+    is a single Ctrl+Z step.  On error the transaction is aborted
+    (no partial objects left behind).
+
+    Parameters
+    ----------
+    doc : FreeCAD.Document
+        Active document.
+    object_name : str
+        Name for the new Part::Feature (e.g. "HipCap_Roof").
+    shape : Part.Shape
+        The shape to assign (Compound, Solid, etc.).
+    generator_name : str
+        Value for the GeneratorName metadata property.
+    generator_version : str
+        Value for the GeneratorVersion metadata property.
+    extra_props : dict, optional
+        Additional ``{prop_name: (prop_type, group, tooltip, value)}``
+        entries.  Example::
+
+            {"SeamType": ("App::PropertyString", "Metadata",
+                          "Seam type (hip or valley)", "hip")}
+
+    transaction_label : str, optional
+        Label shown in Edit→Undo.  Defaults to
+        ``"{generator_name}: {object_name}"``.
+
+    Returns
+    -------
+    FreeCAD.DocumentObject
+        The newly created Part::Feature.
+    """
+    label = transaction_label or f"{generator_name}: {object_name}"
+    doc.openTransaction(label)
+    try:
+        result = doc.addObject("Part::Feature", object_name)
+        result.Shape = shape
+
+        result.addProperty(
+            "App::PropertyString", "GeneratorName", "Metadata", "Generator name")
+        result.GeneratorName = generator_name
+
+        result.addProperty(
+            "App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
+        result.GeneratorVersion = generator_version
+
+        if extra_props:
+            for prop_name, (prop_type, group, tooltip, value) in extra_props.items():
+                result.addProperty(prop_type, prop_name, group, tooltip)
+                setattr(result, prop_name, value)
+
+        doc.recompute()
+        doc.commitTransaction()
+    except Exception:
+        doc.abortTransaction()
+        raise
+
+    return result

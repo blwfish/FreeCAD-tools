@@ -1,11 +1,19 @@
 """
-Roof Seam Generator for FreeCAD v1.5.1
+Roof Seam Generator for FreeCAD v2.0.0
 Generates hip cap shingles or valley flashing between two selected roof faces.
 
 Author: Brian (with Claude assistance)
 Usage: Ctrl+click two adjacent roof faces, run as macro in FreeCAD
 
 Version History:
+- 1.7.0: Narrow hip caps to half width (cap_width/4 per side). Extend
+         halves past seam so exterior surfaces overlap at the hip ridge,
+         closing the V-groove between slopes. Remove face-extrusion
+         clipping which was trimming at the seam edge, preventing overlap.
+- 1.6.0: Lift hip caps above roof surface by materialThickness so they
+         sit on top of the field shingles rather than at the bare roof plane.
+         Without this offset, tapered field shingles (v5.2.0) are thicker
+         than the caps' placement plane, burying the caps.
 - 1.5.1: Fix taper direction for inward-Z halves. When outward=False the Z
          axis points into the roof, so the Z=0 face is the visible exterior.
          make_tapered_box() now accepts taper_top: True puts taper on Z=max
@@ -96,9 +104,12 @@ import FreeCADGui as Gui
 import Part
 from FreeCAD import Vector
 import math
+import os
 import sys
+sys.path.insert(0, os.path.join(App.getUserMacroDir(True), "_lib"))
+from freecad_utils import commit_result
 
-VERSION = "1.5.1"
+VERSION = "2.0.2"
 GENERATOR_NAME = "roof_seam_generator"
 
 
@@ -396,120 +407,202 @@ def generate_hip_caps(shared_edge, face1, face2, params):
     cap_width    = params.get('hipCapWidth', params.get('shingleWidth', 3.5))
     cap_height   = params.get('shingleHeight', 2.0)
     mat_thick    = params.get('materialThickness', 0.25)
+    wedge_thick  = params.get('shingleWedgeThickness', mat_thick * 3)
     exposure     = params.get('shingleExposure', 1.5)
-    # Extend each half past the ridge by mat_thick so the two halves
-    # overlap at the seam, closing the V-channel between slopes.
-    half_width   = cap_width / 2.0 + mat_thick
+    butt_thick   = mat_thick
+    top_thick    = mat_thick * 0.2
+    half_width   = cap_width / 2.0
+    cap_lift     = mat_thick
 
     App.Console.PrintMessage(
         f"Hip cap: width={cap_width:.2f}  height={cap_height:.2f}  "
-        f"thickness={mat_thick:.2f}  exposure={exposure:.2f}\n"
+        f"thickness={mat_thick:.2f}  exposure={exposure:.2f}  "
+        f"lift={cap_lift:.2f}  half_width={half_width:.2f}\n"
     )
 
     # Edge geometry — orient so we iterate from eave (low Z) to apex (high Z).
-    # Hip caps are installed bottom-up: each successive cap sits mat_thick
-    # higher than the previous, creating the visible overlap/stagger.
     v0 = shared_edge.Vertexes[0].Point
     v1 = shared_edge.Vertexes[-1].Point
     if v0.z <= v1.z:
-        start_pt, end_pt = v0, v1      # eave → apex
+        start_pt, end_pt = v0, v1
     else:
-        start_pt, end_pt = v1, v0      # flip so eave is first
+        start_pt, end_pt = v1, v0
     edge_vec   = end_pt - start_pt
     edge_len   = edge_vec.Length
     edge_dir   = edge_vec * (1.0 / edge_len)
 
-    # Face normals (outward from roof surface)
+    # Outward face normals (positive Z for non-vertical roofs).
     n1 = face_normal_at_center(face1)
     n2 = face_normal_at_center(face2)
+    n1_out = App.Vector(-n1.x, -n1.y, -n1.z) if n1.z < 0 else App.Vector(n1.x, n1.y, n1.z)
+    n2_out = App.Vector(-n2.x, -n2.y, -n2.z) if n2.z < 0 else App.Vector(n2.x, n2.y, n2.z)
 
     seam_mid = (start_pt + end_pt) * 0.5
 
-    def half_cap_setup(n, face_centroid):
-        """
-        Compute rotation and corner offset for one half-cap.
-
-        Returns (rotation, z_outward) where z_outward is True if the box
-        sits naturally on the surface (corner at seam point) or False if
-        the corner must be offset by mat_thick along n.
-        """
-        # d: perpendicular to edge, in face plane
-        d_raw = n.cross(edge_dir)
-        d     = d_raw * (1.0 / d_raw.Length)
-
-        # Sign-correct d to point toward face interior
+    # d1, d2: directions from seam toward each face interior,
+    # perpendicular to edge, in the face plane.
+    def compute_d(n_out, face_centroid):
+        d_raw = n_out.cross(edge_dir)
+        d = d_raw * (1.0 / d_raw.Length)
         if (face_centroid - seam_mid).dot(d) < 0:
             d = d * -1.0
+        return d
 
-        # Z = d × edge_dir — guaranteed right-handed with X=d, Y=edge_dir
-        z = d.cross(edge_dir)
-        z = z * (1.0 / z.Length)
+    d1 = compute_d(n1_out, face1.CenterOfMass)
+    d2 = compute_d(n2_out, face2.CenterOfMass)
 
-        outward = z.dot(n) >= 0
-
-        App.Console.PrintMessage(
-            f"    d=({d.x:.3f},{d.y:.3f},{d.z:.3f})  "
-            f"z=({z.x:.3f},{z.y:.3f},{z.z:.3f})  outward={outward}\n"
-        )
-
-        rot = App.Rotation(make_rotation_matrix(d, edge_dir, z))
-        return rot, outward, n
+    # Bisector of outward normals — used for ridge lift.
+    bisector = n1_out + n2_out
+    bisector = bisector * (1.0 / bisector.Length)
 
     App.Console.PrintMessage(
         f"  edge_dir: ({edge_dir.x:.3f}, {edge_dir.y:.3f}, {edge_dir.z:.3f})\n"
-        f"  n1:       ({n1.x:.3f}, {n1.y:.3f}, {n1.z:.3f})\n"
-        f"  n2:       ({n2.x:.3f}, {n2.y:.3f}, {n2.z:.3f})\n"
+        f"  n1_out:   ({n1_out.x:.3f}, {n1_out.y:.3f}, {n1_out.z:.3f})\n"
+        f"  n2_out:   ({n2_out.x:.3f}, {n2_out.y:.3f}, {n2_out.z:.3f})\n"
+        f"  d1:       ({d1.x:.3f}, {d1.y:.3f}, {d1.z:.3f})\n"
+        f"  d2:       ({d2.x:.3f}, {d2.y:.3f}, {d2.z:.3f})\n"
     )
 
-    App.Console.PrintMessage("  Face 1 half:\n")
-    rot1, outward1, _ = half_cap_setup(n1, face1.CenterOfMass)
-    App.Console.PrintMessage("  Face 2 half:\n")
-    rot2, outward2, _ = half_cap_setup(n2, face2.CenterOfMass)
+    def make_bent_profile(pt, thickness):
+        """
+        Create a bent cross-section wire at position pt along the edge.
 
-    # Clipping solids: extrude each roof face along its outward normal.
-    # Boolean-intersecting each half-cap with the clip solid trims caps that
-    # overhang the eave at the bottom of a hip seam.
-    #
-    # Extrude by 3× mat_thick (not 1×) so the clip solid fully envelops
-    # the cap in the normal direction, avoiding coplanar faces that cause
-    # OCCT boolean degenerate edges.
-    clip_thick = mat_thick * 3.0
-    clip1 = face1.extrude(n1 * clip_thick)
-    clip2 = face2.extrude(n2 * clip_thick)
+        The profile is a V-shape (following both roof slopes) with
+        thickness offset perpendicular to each slope.  An arc at the
+        ridge connects the two exterior surfaces with a gentle dome,
+        eliminating the V-groove that two separate halves would create.
 
-    # Tapered profile: butt edge (exposed, Y=0) is full mat_thick;
-    # covered edge (Y=cap_height) tapers to ~20%.  The taper creates
-    # a visible shadow-line at each butt edge without cumulative stagger.
-    butt_thick = mat_thick
-    top_thick  = mat_thick * 0.2
+        Cross-section points:
+          bl  — face 1 wing tip, on roof surface
+          bc  — ridge/seam, on roof surface (V bottom)
+          br  — face 2 wing tip, on roof surface
+          tr  — face 2 wing tip, exterior
+          tc2 — ridge exterior, face 2 side (arc endpoint)
+          tc1 — ridge exterior, face 1 side (arc endpoint)
+          tl  — face 1 wing tip, exterior
+
+        The ridge arc from tc2 → tc1 replaces a flat segment, matching
+        the reference cap-profile model.
+        """
+        # Lift each wing along its face normal; lift ridge along bisector.
+        lift1 = n1_out * cap_lift
+        lift2 = n2_out * cap_lift
+        lift_c = bisector * cap_lift
+
+        # Bottom points (on roof surface, lifted above field shingles)
+        bl = pt + d1 * half_width + lift1
+        bc = pt + lift_c
+        br = pt + d2 * half_width + lift2
+
+        # Top points (exterior, offset perpendicular to each slope)
+        tl  = bl + n1_out * thickness
+        tc1 = bc + n1_out * thickness
+        tc2 = bc + n2_out * thickness
+        tr  = br + n2_out * thickness
+
+        # Ridge arc: gentle dome connecting tc2 → tc1.
+        # Midpoint sits above the chord midpoint along the bisector.
+        chord_mid = (tc1 + tc2) * 0.5
+        sagitta = thickness * 1.0
+        arc_mid = chord_mid + bisector * sagitta
+
+        # Build wire from line edges + arc
+        edges = [
+            Part.makeLine(bl, bc),
+            Part.makeLine(bc, br),
+            Part.makeLine(br, tr),
+            Part.makeLine(tr, tc2),
+            Part.Arc(tc2, arc_mid, tc1).toShape(),
+            Part.makeLine(tc1, tl),
+            Part.makeLine(tl, bl),
+        ]
+        wire = Part.Wire(edges)
+        return wire
+
+    # Clipping solid: union of both face extrusions for eave trimming.
+    clip_thick = butt_thick * 5.0 + cap_lift
+    clip1 = face1.extrude(n1_out * clip_thick)
+    clip2 = face2.extrude(n2_out * clip_thick)
+    clip_union = clip1.fuse(clip2).removeSplitter()
+
+    # Verify normals are perpendicular to edge (required for planar profiles).
+    dot1 = n1_out.dot(edge_dir)
+    dot2 = n2_out.dot(edge_dir)
+    App.Console.PrintMessage(
+        f"  n1_out·edge_dir={dot1:.6f}  n2_out·edge_dir={dot2:.6f}\n"
+    )
 
     shapes = []
     clipped_count = 0
+    loft_ok = 0
+    loft_fail = 0
+    extrude_ok = 0
     t = 0.0
     while t < edge_len:
         pt = start_pt + edge_dir * t
 
-        for clip, rot, outward, n in [
-            (clip1, rot1, outward1, n1),
-            (clip2, rot2, outward2, n2),
-        ]:
-            h = make_tapered_box(half_width, cap_height, butt_thick, top_thick, taper_top=outward)
-            corner = pt if outward else pt + n * butt_thick
-            h.Placement = App.Placement(corner, rot)
+        # Two profile wires: butt (thick) and covered (thin).
+        butt_wire = make_bent_profile(pt, butt_thick)
+        covered_wire = make_bent_profile(pt + edge_dir * cap_height, top_thick)
 
-            trimmed = h.common(clip)
-            if trimmed.Solids:
-                shapes.append(trimmed)
-            elif trimmed.Volume > 1e-6:
-                shapes.append(trimmed)
-            else:
+        # Loft between thick butt and thin covered profiles for taper.
+        # Extrude fallback gives constant thickness (no taper).
+        cap = None
+        try:
+            cap = Part.makeLoft([butt_wire, covered_wire], True)
+            loft_ok += 1
+        except Exception as e:
+            if t == 0.0:
+                App.Console.PrintMessage(f"  Loft failed: {e}\n")
+                # Dump wire info
+                App.Console.PrintMessage(
+                    f"  butt_wire: {len(butt_wire.Edges)} edges, closed={butt_wire.isClosed()}\n"
+                    f"  covered_wire: {len(covered_wire.Edges)} edges, closed={covered_wire.isClosed()}\n"
+                )
+
+        if cap is None:
+            try:
+                butt_face = Part.Face(butt_wire)
+                cap = butt_face.extrude(edge_dir * cap_height)
+                extrude_ok += 1
+            except Exception:
+                loft_fail += 1
+                t += exposure
                 clipped_count += 1
+                continue
+
+        # Diagnostic on first cap
+        if t == 0.0:
+            bb = cap.BoundBox
+            App.Console.PrintMessage(
+                f"  First cap: vol={cap.Volume:.6f} solids={len(cap.Solids)} "
+                f"faces={len(cap.Faces)} "
+                f"bbox=[{bb.XMin:.2f},{bb.XMax:.2f}]x"
+                f"[{bb.YMin:.2f},{bb.YMax:.2f}]x"
+                f"[{bb.ZMin:.2f},{bb.ZMax:.2f}]\n"
+            )
+
+        # Add cap directly — no clipping.  The bent profile already
+        # conforms to both face slopes so clipping is unnecessary,
+        # and common(clip_union) splits the dome at the ridge seam.
+        if cap.Solids:
+            for solid in cap.Solids:
+                shapes.append(solid)
+        elif cap.Volume > 1e-6:
+            shapes.append(cap)
 
         t += exposure
 
+    App.Console.PrintMessage(
+        f"  Cap creation: extrude={extrude_ok} loft={loft_ok} fail={loft_fail}\n"
+    )
+
     if clipped_count:
-        App.Console.PrintMessage(f"  Clipped away {clipped_count} half-caps outside face boundary\n")
-    App.Console.PrintMessage(f"  Generated {len(shapes)} hip cap pieces\n")
+        App.Console.PrintMessage(f"  Clipped away {clipped_count} caps outside face boundary\n")
+
+    App.Console.PrintMessage(
+        f"  Generated {len(shapes)} hip cap pieces\n"
+    )
     return shapes
 
 
@@ -675,21 +768,16 @@ if __name__ == "__main__":
                         App.Console.PrintError("ERROR: No geometry generated.\n")
 
                     else:
-                        # --- Create output Part::Feature ---
+                        # --- Create output Part::Feature (undoable) ---
                         compound = Part.Compound(shapes)
-                        result = doc.addObject("Part::Feature", output_name)
-                        result.Shape = compound
-
-                        result.addProperty("App::PropertyString", "GeneratorName",    "Metadata", "Generator name")
-                        result.GeneratorName    = GENERATOR_NAME
-
-                        result.addProperty("App::PropertyString", "GeneratorVersion", "Metadata", "Generator version")
-                        result.GeneratorVersion = VERSION
-
-                        result.addProperty("App::PropertyString", "SeamType",         "Metadata", "Seam type (hip or valley)")
-                        result.SeamType         = seam_type
-
-                        doc.recompute()
+                        commit_result(
+                            doc, output_name, compound,
+                            GENERATOR_NAME, VERSION,
+                            extra_props={
+                                "SeamType": ("App::PropertyString", "Metadata",
+                                             "Seam type (hip or valley)", seam_type),
+                            },
+                        )
 
                         App.Console.PrintMessage(f"\n{'='*60}\n")
                         App.Console.PrintMessage(f"SUCCESS: Created '{output_name}' ({len(shapes)} piece(s))\n")

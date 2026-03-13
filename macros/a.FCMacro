@@ -1,0 +1,46 @@
+# -*- coding: utf-8 -*-
+
+# Macro Begin: /Users/blw/Documents/FreeCAD/macros/a.FCMacro +++++++++++++++++++++++++++++++++++++++++++++++++
+import FreeCAD
+import Sketcher
+
+# Gui.runCommand('Std_DlgMacroRecord',0)
+# Gui.runCommand('Sketcher_CompCreateRectangles',0)
+lastGeoId = len(ActiveSketch.Geometry)
+
+geoList = []
+geoList.append(Part.LineSegment(App.Vector(0.000000, 0.000000, 0.000000),App.Vector(22.103724, 0.000000, 0.000000)))
+geoList.append(Part.LineSegment(App.Vector(22.103724, 0.000000, 0.000000),App.Vector(22.103724, 10.980886, 0.000000)))
+geoList.append(Part.LineSegment(App.Vector(22.103724, 10.980886, 0.000000),App.Vector(0.000000, 10.980886, 0.000000)))
+geoList.append(Part.LineSegment(App.Vector(0.000000, 10.980886, 0.000000),App.Vector(0.000000, 0.000000, 0.000000)))
+App.getDocument('Unnamed').getObject('Sketch').addGeometry(geoList,False)
+del geoList
+
+constraintList = []
+constraintList.append(Sketcher.Constraint('Coincident', 0, 2, 1, 1))
+constraintList.append(Sketcher.Constraint('Coincident', 1, 2, 2, 1))
+constraintList.append(Sketcher.Constraint('Coincident', 2, 2, 3, 1))
+constraintList.append(Sketcher.Constraint('Coincident', 3, 2, 0, 1))
+constraintList.append(Sketcher.Constraint('Horizontal', 0))
+constraintList.append(Sketcher.Constraint('Horizontal', 2))
+constraintList.append(Sketcher.Constraint('Vertical', 1))
+constraintList.append(Sketcher.Constraint('Vertical', 3))
+App.getDocument('Unnamed').getObject('Sketch').addConstraint(constraintList)
+del constraintList
+
+App.getDocument('Unnamed').getObject('Sketch').addConstraint(Sketcher.Constraint('Coincident', 0, 1, -1, 1))
+
+
+App.ActiveDocument.recompute()
+# Gui.runCommand('Sketcher_CompCreateCircle',0)
+lastGeoId = len(ActiveSketch.Geometry)
+
+geoList = []
+geoList.append(Part.Circle(App.Vector(6.041177, 6.929714, 0.000000), App.Vector(0.000000, 0.000000, 1.000000), 3.499949))
+App.getDocument('Unnamed').getObject('Sketch').addGeometry(geoList,False)
+del geoList
+
+constraintList = []
+constraintList = []
+App.ActiveDocument.recompute()
+# Macro End: /Users/blw/Documents/FreeCAD/macros/a.FCMacro +++++++++++++++++++++++++++++++++++++++++++++++++

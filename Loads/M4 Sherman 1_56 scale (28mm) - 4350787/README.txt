@@ -1,0 +1,1 @@
+M4 Sherman 1:56 scale (28mm) by Foolyo89 on Thingiverse: https://www.thingiverse.com/thing:4350787

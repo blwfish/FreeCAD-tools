@@ -1,0 +1,13 @@
+# -*- coding: utf-8 -*-
+
+# Macro Begin: /Users/blw/Documents/FreeCAD/macros/MakeLayers.FCMacro +++++++++++++++++++++++++++++++++++++++++++++++++
+import FreeCAD
+import PartDesignGui
+import gui_layers
+
+# Gui.runCommand('Std_DlgMacroRecord',0)
+### Begin command Std_Workbench
+# Gui.activateWorkbench("DraftWorkbench")
+### End command Std_Workbench
+# Gui.runCommand('Draft_LayerManager',0)
+# Macro End: /Users/blw/Documents/FreeCAD/macros/MakeLayers.FCMacro +++++++++++++++++++++++++++++++++++++++++++++++++
