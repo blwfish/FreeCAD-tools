@@ -2,6 +2,8 @@
 
 Parametric generators for model railroading in FreeCAD. All generators create photorealistic architectural details optimized for 3D printing and laser cutting at HO scale (1:87).
 
+> **Note:** These macros are developed and tested against FreeCAD 1.2-dev. Behavior on other versions is not guaranteed.
+
 ## Quick Start
 
 1. **Open Skeleton.FCStd** from `General Parts/` to access shared parameters
