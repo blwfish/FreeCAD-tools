@@ -4,6 +4,10 @@
 *.FCStd1
 *.dxf
 
+# Exported mesh files
+*.stl
+*.STL
+
 # macOS
 .DS_Store
 .AppleDouble

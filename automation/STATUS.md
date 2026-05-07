@@ -25,7 +25,7 @@ Run on any model with a `params` spreadsheet to catch unprintable dimensions.
 | clapboard_generator | v6.0.0 | Production | Yes | geometry lib + macro |
 | board_batten_generator | v1.0.0 | Production | Yes | geometry lib + macro |
 | bead_board_generator | v1.0.0 | Production | Yes | geometry lib + macro |
-| smart_trim | v1.2.0 | Production | Yes | geometry lib + macro |
+| smart_trim | v1.4.0 | Production | Yes | geometry lib + macro |
 | station_sign | v1.1.1 | Production | No | standalone macro |
 
 ## Skeleton.FCStd Parameters
@@ -102,11 +102,11 @@ Central parameter spreadsheet for all generators.
 - **Files:** `bead_board_generator.FCMacro`, `bead_board_geometry.py`
 - **Tests:** Unit tests included
 
-### Smart Trim Generator v1.2.0
+### Smart Trim Generator v1.4.0
 - **Purpose:** Parametric trim for architectural models
-- **Features:** Automatic corner detection, miter angle calculation
+- **Features:** Automatic corner detection, miter angle calculation, mitered corner joints
 - **Files:** `smart_trim_generator.FCMacro`, `trim_geometry.py`
-- **Tests:** Test suite included
+- **Tests:** Test suite included (corner detection + miter integration)
 
 ### Station Sign Generator v1.1.1
 - **Purpose:** C&O style station signs with parametric text
@@ -155,7 +155,7 @@ generator/
 ## Pending Work
 
 1. **Station Sign Generator:** Add automated test suite
-2. **Smart Trim:** Implement mitered corner pieces (v1.3.0)
+2. **Smart Trim:** Curved edge support
 3. **All Generators:** TNP-safe property links (App::PropertyLink)
 
 ## File Locations
